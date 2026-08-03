@@ -1,0 +1,2751 @@
+import express from "express";
+import cors from "cors";
+import morgan from "morgan";
+import dotenv from "dotenv";
+import crypto from "node:crypto";
+import multer from "multer";
+import { nanoid } from "nanoid";
+import { lotteries, users, announcements, purchaseHistory, defaultResults } from "./data.js";
+import { pool, testConnection } from "./db.js";
+import {
+  hasDatabase,
+  createUserAccount,
+  updateUserCredit,
+  updateUserPassword,
+  saveTicketRecord,
+  logPurchase,
+  fetchPurchaseLogs,
+  fetchNumberSummaryForDraw,
+  fetchNumberSummaryForRange,
+  fetchPayoutRates,
+  replacePayoutRates,
+  listUsers,
+  fetchCreditSummary,
+  findUserWithSecret,
+  ensureSuperAdmin,
+  seedInitialData,
+  listNumberRestrictions,
+  createNumberRestriction,
+  deleteNumberRestriction,
+  fetchLatestResults,
+  upsertLotteryResult,
+  adjustUserCreditUsage,
+  createNotification,
+  fetchNotifications,
+  fetchTicketById,
+  markTicketResult,
+  recalcTicketStatusFromItems,
+  markNotificationRead,
+  countOpenLotteries,
+  sumTicketAmount,
+  fetchLedger,
+  fetchDailyTicketSummary,
+  fetchIncomeReportFromDb,
+  fetchUserProfile,
+  upsertUserProfile,
+  recordTransaction,
+  listTransactions,
+  fetchTransactionById,
+  updateTransactionStatus,
+  recordAuditLog,
+  listAuditLogs,
+  listPromotions,
+  fetchLotteryRounds,
+  upsertLotteryRounds,
+  getLiveSetting,
+  setLiveSetting,
+  appendChatMessage,
+  listChatMessages,
+  listChatThreads,
+  upsertLottery,
+  applyPayoutToUser,
+  fetchPurchaseLogsByTicket,
+  markPurchaseLogsStatus
+} from "./repositories/managementRepository.js";
+import { evaluateTicketsForDraw } from "./services/evaluateTickets.js";
+import { syncThaiLottoFromApi } from "./services/thaiLottoSync.js";
+
+dotenv.config();
+
+const superAdminConfig = {
+  username: process.env.SUPERADMIN_USERNAME || "superadmin",
+  password: process.env.SUPERADMIN_PASSWORD || "Sup3rDemo!",
+  creditLimit: Number(process.env.SUPERADMIN_CREDIT_LIMIT || 500000)
+};
+
+const DEMO_AGENT_PASSWORD = process.env.DEMO_AGENT_PASSWORD || "AgentDemo123!";
+const demoAgentPasswordHash = crypto.createHash("sha256").update(DEMO_AGENT_PASSWORD).digest("hex");
+const superAdminPasswordHash = crypto.createHash("sha256").update(superAdminConfig.password).digest("hex");
+
+const lotteryKindMap = {
+  "th-lottery": "thai",
+  "lao-lottery": "lao"
+};
+
+const lotterySeeds = lotteries.map((item) => ({
+  code: item.id,
+  name: item.name,
+  kind: lotteryKindMap[item.id] ?? "thai",
+  openTime: item.openTime,
+  closeTime: item.closeTime,
+  status: item.status,
+  description: item.description
+}));
+
+const userSeeds = [
+  ...users
+    .filter((user) => user.role !== "admin")
+    .map((user) => ({
+      username: user.username,
+      role: user.role ?? "agent",
+      creditLimit: user.creditLimit,
+      creditUsed: user.creditUsed,
+      passwordHash: demoAgentPasswordHash
+    })),
+  {
+    username: "agentdemo",
+    role: "agent",
+    creditLimit: 80000,
+    creditUsed: 15000,
+    passwordHash: demoAgentPasswordHash
+  }
+];
+
+function normalizeNumberList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // ignore parse failure
+    }
+    return value
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+const fallbackTransactions = [];
+const fallbackAuditLogs = [];
+const fallbackChatThreads = new Map();
+let fallbackLiveEnabled = true;
+const fallbackProfiles = new Map();
+const highlightSeed = {
+  thai: {
+    three: ["145", "908", "672"],
+    two: ["50", "90", "12"]
+  },
+  lao: {
+    three: ["901", "228", "443"],
+    two: ["35", "77", "10"]
+  }
+};
+const fallbackPromotions = [
+  { code: "STANDARD", title: "ราคาปกติ", description: "จ่ายเต็มทุกประเภท", discount_percent: 0 },
+  { code: "DISCOUNT30", title: "ลด 30%", description: "ลดต้นทุนโพย 30% สำหรับช่วงโปรโมชัน", discount_percent: 30 }
+];
+
+function appendFallbackChatMessage(username, sender, message) {
+  const thread = fallbackChatThreads.get(username) || [];
+  const record = { id: `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`, sender, message, created_at: new Date().toISOString() };
+  thread.push(record);
+  fallbackChatThreads.set(username, thread);
+  return record;
+}
+
+function getFallbackChatHistory(username) {
+  return fallbackChatThreads.get(username) || [];
+}
+
+const CANCEL_WINDOW_MINUTES = 30;
+
+function resolveDrawDateForLottery(lotteryId, createdAt) {
+  if (!createdAt) return null;
+  const base = new Date(createdAt);
+  if (Number.isNaN(base.getTime())) return null;
+  const id = (lotteryId || "").toLowerCase();
+  if (id.includes("th-lottery") || id.includes("thai")) {
+    const day = base.getDate();
+    const month = base.getMonth();
+    const year = base.getFullYear();
+    if (day <= 1) return new Date(year, month, 1).toISOString().slice(0, 10);
+    if (day <= 16) return new Date(year, month, 16).toISOString().slice(0, 10);
+    const nextMonth = month + 1;
+    const rolloverYear = nextMonth > 11 ? year + 1 : year;
+    const rolloverMonth = nextMonth > 11 ? 0 : nextMonth;
+    return new Date(rolloverYear, rolloverMonth, 1).toISOString().slice(0, 10);
+  }
+  if (id.includes("lao")) {
+    const targetDays = [1, 3, 5]; // Mon, Wed, Fri
+    const iter = new Date(base);
+    for (let i = 0; i < 7; i += 1) {
+      const dow = iter.getDay();
+      if (targetDays.includes(dow)) {
+        return new Date(iter.getFullYear(), iter.getMonth(), iter.getDate())
+          .toISOString()
+          .slice(0, 10);
+      }
+      iter.setDate(iter.getDate() + 1);
+    }
+  }
+  return base.toISOString().slice(0, 10);
+}
+
+function resolveLotteryCloseTime(lottery, drawDate) {
+  if (!lottery?.closeTime) return null;
+  const raw = String(lottery.closeTime);
+  const match = raw.match(/T(\d{2}:\d{2})(?::\d{2})?(Z|[+-]\d{2}:\d{2})?/);
+  const timePart = match?.[1] ?? "00:00";
+  const offset = match?.[2] ?? "+07:00";
+  if (!drawDate) {
+    const direct = new Date(raw);
+    return Number.isNaN(direct.getTime()) ? null : direct;
+  }
+  const composed = new Date(`${drawDate}T${timePart}:00${offset}`);
+  if (!Number.isNaN(composed.getTime())) return composed;
+  const fallback = new Date(raw);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
+
+async function resolveUsernameById(userId) {
+  if (!userId) return null;
+  if (hasDatabase()) {
+    try {
+      const { rows } = await pool.query("SELECT username FROM users WHERE id = $1", [userId]);
+      return rows?.[0]?.username ?? null;
+    } catch (err) {
+      console.error("resolve username failed:", err.message || err);
+    }
+  }
+  const fallbackUser = users.find((user) => String(user.id) === String(userId));
+  return fallbackUser?.username ?? null;
+}
+
+async function appendAuditLogEntry({
+  action,
+  actorId,
+  actorUsername,
+  targetUserId,
+  targetUsername,
+  amount,
+  txnType,
+  status,
+  note,
+  transactionId
+}) {
+  const details = {
+    actorUsername: actorUsername ?? null,
+    targetUserId: targetUserId ?? null,
+    targetUsername: targetUsername ?? null,
+    amount: typeof amount === "number" ? amount : amount ?? null,
+    txnType: txnType ?? null,
+    status: status ?? null,
+    note: note ?? null,
+    transactionId: transactionId ?? null
+  };
+  if (hasDatabase()) {
+    try {
+      await recordAuditLog({ userId: actorId ?? null, action, details });
+      return;
+    } catch (err) {
+      if (err.code !== "AUDIT_LOG_UNAVAILABLE") {
+        console.error("record audit log failed:", err.message || err);
+      }
+    }
+  }
+  fallbackAuditLogs.unshift({
+    id: `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    action,
+    actorUsername: actorUsername ?? null,
+    details,
+    created_at: new Date().toISOString()
+  });
+}
+
+function normalizeAuditEntry(entry) {
+  let details = entry.details ?? {};
+  if (typeof details === "string") {
+    try {
+      details = JSON.parse(details);
+    } catch {
+      details = {};
+    }
+  }
+  return {
+    id: entry.id,
+    action: entry.action,
+    actorUsername: entry.actorUsername ?? details.actorUsername ?? null,
+    targetUserId: details.targetUserId ?? null,
+    targetUsername: details.targetUsername ?? null,
+    amount: details.amount ?? null,
+    txnType: details.txnType ?? null,
+    status: details.status ?? null,
+    note: details.note ?? null,
+    transactionId: details.transactionId ?? null,
+    createdAt: entry.created_at ?? entry.createdAt ?? null
+  };
+}
+
+const payoutSeeds = {
+  "th-lottery": [
+    { betType: "three-top", rate: 950 },
+    { betType: "three-tod", rate: 150 },
+    { betType: "three-bottom", rate: 450 },
+    { betType: "three-front", rate: 450 },
+    { betType: "three-front-tod", rate: 90 },
+    { betType: "two-top", rate: 95 },
+    { betType: "two-bottom", rate: 95 },
+    { betType: "run-top", rate: 3.2 },
+    { betType: "run-bottom", rate: 4.2 }
+  ],
+  "gsb-lottery": [
+    { betType: "three-top", rate: 950 },
+    { betType: "three-tod", rate: 150 },
+    { betType: "three-bottom", rate: 450 },
+    { betType: "three-front", rate: 450 },
+    { betType: "three-front-tod", rate: 90 },
+    { betType: "two-top", rate: 95 },
+    { betType: "two-bottom", rate: 95 },
+    { betType: "run-top", rate: 3.2 },
+    { betType: "run-bottom", rate: 4.2 }
+  ],
+  "baac-lottery": [
+    { betType: "three-top", rate: 950 },
+    { betType: "three-tod", rate: 150 },
+    { betType: "three-bottom", rate: 450 },
+    { betType: "three-front", rate: 450 },
+    { betType: "three-front-tod", rate: 90 },
+    { betType: "two-top", rate: 95 },
+    { betType: "two-bottom", rate: 95 },
+    { betType: "run-top", rate: 3.2 },
+    { betType: "run-bottom", rate: 4.2 }
+  ],
+  "lao-lottery": [
+    { betType: "three-top", rate: 850 },
+    { betType: "three-tod", rate: 120 },
+    { betType: "two-top", rate: 90 },
+    { betType: "two-bottom", rate: 90 },
+    { betType: "run-top", rate: 3.0 },
+    { betType: "run-bottom", rate: 4.0 }
+  ],
+  "lao-vip": [
+    { betType: "three-top", rate: 850 },
+    { betType: "three-tod", rate: 120 },
+    { betType: "two-top", rate: 90 },
+    { betType: "two-bottom", rate: 90 },
+    { betType: "run-top", rate: 3.0 },
+    { betType: "run-bottom", rate: 4.0 }
+  ],
+  "lao-star": [
+    { betType: "three-top", rate: 850 },
+    { betType: "three-tod", rate: 120 },
+    { betType: "two-top", rate: 90 },
+    { betType: "two-bottom", rate: 90 },
+    { betType: "run-top", rate: 3.0 },
+    { betType: "run-bottom", rate: 4.0 }
+  ]
+};
+
+function isWinningNumberAgainstResult(number, result) {
+  if (!result || !number) return false;
+  const num = String(number).trim();
+  const { firstPrize, frontThree = [], backThree = [], twoDigits, nearFirst = [] } = result;
+  if (num.length === 6 && firstPrize && num === firstPrize) return true;
+  if (num.length === 6 && Array.isArray(nearFirst) && nearFirst.includes(num)) return true;
+  if (num.length === 3 && Array.isArray(frontThree) && frontThree.includes(num)) return true;
+  if (num.length === 3 && Array.isArray(backThree) && backThree.includes(num)) return true;
+  if (num.length === 2 && twoDigits && num === twoDigits) return true;
+  return false;
+}
+
+function hydrateTicketsWithResults(items, resultsMap = {}) {
+  const betTypeLabelMap = {
+    "three-top": "3 ตัวบน",
+    "three-tod": "3 ตัวโต๊ด",
+    "three-bottom": "3 ตัวล่าง",
+    "three-front": "3 หัว",
+  "three-front-tod": "3 หัวโต๊ด",
+  "two-top": "2 ตัวบน",
+  "two-bottom": "2 ตัวล่าง",
+  "run-top": "วิ่งบน",
+  "run-bottom": "วิ่งล่าง",
+  standard: "สองตัว · 2 ตัวบน"
+  };
+  return (items || []).map((item) => {
+    const numbers = normalizeNumberList(item.numbers ?? item.betNumbers);
+    const ticketItems =
+      Array.isArray(item.items) && item.items.length
+        ? item.items
+        : numbers.map((num) => ({
+            id: `${item.id}-${num}`,
+            number: num,
+            amount: item.amount ? Number(item.amount) / numbers.length : Number(item.debit ?? 0) / numbers.length,
+            betType: item.betType || "standard",
+            betTypeLabel: item.betTypeLabel || betTypeLabelMap[item.betType] || betTypeLabelMap.standard
+          }));
+    const result = resultsMap?.[item.lotteryId] || resultsMap?.[(item.lotteryId || "").toLowerCase()];
+    const isWinner = item.status === "won" || numbers.some((num) => isWinningNumberAgainstResult(num, result));
+    const creditValue = isWinner ? item.credit ?? item.potentialPayout ?? item.amount ?? 0 : item.credit ?? 0;
+    return {
+      ...item,
+      numbers,
+      items: ticketItems,
+      status: isWinner ? "won" : item.status || "pending",
+      credit: creditValue
+    };
+  });
+}
+
+const app = express();
+const PORT = process.env.PORT || 4001;
+
+app.use(cors());
+app.use(express.json());
+app.use(morgan("dev"));
+
+// Multer for handling multipart form-data (e.g. deposit slip uploads). Memory storage for now.
+const upload = multer({ storage: multer.memoryStorage() });
+
+const sessions = new Map();
+
+// In-memory settings store (persist in DB if available in the future)
+const appSettings = {
+  autoCloseBeforeMinutes: 15,
+  defaultMinBet: 5,
+  defaultMaxBet: 20000,
+  allowedCurrencies: ["THB"],
+  maintenanceMode: false,
+  depositNotice: "ติดต่อ Admin ของระบบเพื่อยืนยันการฝาก",
+  depositLineUrl: ""
+};
+
+if (pool) {
+  (async () => {
+    try {
+      await testConnection();
+      console.log("✅ Database connection pool initialized");
+      if (superAdminConfig.username && superAdminPasswordHash) {
+        const result = await ensureSuperAdmin({
+          username: superAdminConfig.username,
+          passwordHash: superAdminPasswordHash,
+          creditLimit: superAdminConfig.creditLimit
+        });
+        if (result) {
+          console.log(`👑 Super admin '${result.username}' พร้อมใช้งาน (id: ${result.id})`);
+        }
+      }
+      await seedInitialData({
+        lotteriesSeed: lotterySeeds,
+        usersSeed: userSeeds,
+        payoutSeed: payoutSeeds,
+        resultsSeed: defaultResults
+      });
+      console.log(`📦 เตรียมข้อมูลทดสอบเรียบร้อย (Agent password: ${DEMO_AGENT_PASSWORD})`);
+    } catch (err) {
+      console.error("⚠️  Database connection test failed:", err.message);
+    }
+  })();
+} else {
+  console.warn("ℹ️  Database connection disabled (configuration missing)");
+}
+
+app.get("/api/health/db", async (req, res) => {
+  try {
+    await testConnection();
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
+});
+
+// Admin endpoints: get / update per-lottery round mappings
+app.get('/api/admin/lottery-rounds/:lotteryCode', async (req, res) => {
+  if (req.session?.role !== 'admin') return res.status(403).json({ message: 'ต้องเป็นผู้ดูแลระบบ' });
+  const { lotteryCode } = req.params;
+  if (!lotteryCode) return res.status(400).json({ message: 'ระบุ lotteryCode' });
+  if (!hasDatabase()) return res.status(400).json({ message: 'DB not enabled' });
+  try {
+    const rounds = await fetchLotteryRounds(lotteryCode);
+    return res.json({ success: true, rounds });
+  } catch (err) {
+    console.error('fetchLotteryRounds failed:', err);
+    return res.status(500).json({ message: 'ไม่สามารถดึงการตั้งค่าวงรอบได้' });
+  }
+});
+
+// Public read endpoint for lottery round mappings (used by client display)
+app.get('/api/lottery-rounds/:lotteryCode', async (req, res) => {
+  const { lotteryCode } = req.params;
+  if (!lotteryCode) return res.status(400).json({ message: 'ระบุ lotteryCode' });
+  if (hasDatabase()) {
+    try {
+      const rounds = await fetchLotteryRounds(lotteryCode);
+      return res.json({ success: true, rounds });
+    } catch (err) {
+      console.error('fetchLotteryRounds(public) failed:', err);
+      return res.status(500).json({ message: 'ไม่สามารถดึงการตั้งค่าวงรอบได้' });
+    }
+  }
+  return res.json({ success: true, rounds: [] });
+});
+
+app.post('/api/admin/lottery-rounds/:lotteryCode', async (req, res) => {
+  if (req.session?.role !== 'admin') return res.status(403).json({ message: 'ต้องเป็นผู้ดูแลระบบ' });
+  const { lotteryCode } = req.params;
+  const { rounds } = req.body;
+  if (!lotteryCode) return res.status(400).json({ message: 'ระบุ lotteryCode' });
+  if (!Array.isArray(rounds)) return res.status(400).json({ message: 'rounds ต้องเป็นอาเรย์' });
+  if (!hasDatabase()) return res.status(400).json({ message: 'DB not enabled' });
+  try {
+    await upsertLotteryRounds(lotteryCode, rounds);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('upsertLotteryRounds failed:', err);
+    return res.status(500).json({ message: 'ไม่สามารถบันทึกการตั้งค่าวงรอบได้' });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ message: "ต้องกรอก username และ password" });
+  }
+
+  try {
+    let profile = null;
+    const isShaHash = typeof password === "string" && /^[a-f0-9]{64}$/i.test(password.trim());
+    const normalizedHash = isShaHash ? password.toLowerCase() : crypto.createHash("sha256").update(password ?? "").digest("hex");
+
+    if (hasDatabase()) {
+      const dbUser = await findUserWithSecret(username);
+      if (dbUser && dbUser.password_hash.toLowerCase() === normalizedHash) {
+        profile = {
+          id: dbUser.id,
+          username: dbUser.username,
+          role: dbUser.role,
+          creditLimit: Number(dbUser.credit_limit ?? 0),
+          creditUsed: Number(dbUser.credit_used ?? 0)
+        };
+      } else if (username === superAdminConfig.username && normalizedHash === superAdminPasswordHash) {
+        profile = {
+          id: 0,
+          username: superAdminConfig.username,
+          role: "admin",
+          creditLimit: superAdminConfig.creditLimit,
+          creditUsed: 0
+        };
+        console.warn("[auth] ใช้โปรไฟล์ Super Admin สำรอง");
+      } else {
+        return res.status(401).json({ message: "ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
+      }
+    } else {
+      if (username === superAdminConfig.username && normalizedHash === superAdminPasswordHash) {
+        profile = {
+          id: 0,
+          username: superAdminConfig.username,
+          role: "admin",
+          creditLimit: superAdminConfig.creditLimit,
+          creditUsed: 0
+        };
+      } else {
+        const demoUser = users.find((u) => u.username === username);
+        if (!demoUser || normalizedHash !== demoAgentPasswordHash) {
+          return res.status(401).json({ message: "ไม่พบผู้ใช้" });
+        }
+        profile = {
+          id: demoUser.id,
+          username: demoUser.username,
+          role: demoUser.role,
+          creditLimit: demoUser.creditLimit,
+          creditUsed: demoUser.creditUsed
+        };
+      }
+    }
+
+    const token = nanoid();
+    sessions.set(token, { username: profile.username, role: profile.role, userId: profile.id });
+
+    res.json({ token, profile });
+  } catch (err) {
+    console.error("login failed:", err);
+    res.status(500).json({ message: "ไม่สามารถเข้าสู่ระบบได้", error: err.message });
+  }
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = req.header("x-session-token") || req.body?.token;
+  if (token) {
+    sessions.delete(token);
+  }
+  res.json({ message: "ออกจากระบบเรียบร้อย" });
+});
+
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/public")) return next();
+  if (req.path.startsWith("/api/auth")) return next();
+
+  const token = req.header("x-session-token");
+  const session = token ? sessions.get(token) : null;
+  if (!session) {
+    req.session = {
+      username: "demo-admin",
+      role: "admin",
+      guest: true
+    };
+    return next();
+  }
+
+  req.session = session;
+  next();
+});
+
+app.get("/api/profile", async (req, res) => {
+  if (req.session?.guest) {
+    return res.json({
+      id: 0,
+      username: req.session.username || "demo-admin",
+      role: req.session.role || "admin",
+      creditLimit: 0,
+      creditUsed: 0,
+      creditAvailable: 0,
+      guest: true,
+      account: null
+    });
+  }
+  if (hasDatabase()) {
+    try {
+      const dbUser = await findUserWithSecret(req.session.username);
+      if (!dbUser) {
+        return res.status(404).json({ message: "ไม่พบข้อมูลผู้ใช้" });
+      }
+      const profile = await fetchUserProfile(dbUser.id);
+      return res.json({
+        id: dbUser.id,
+        username: dbUser.username,
+        role: dbUser.role,
+        creditLimit: Number(dbUser.credit_limit ?? 0),
+        creditUsed: Number(dbUser.credit_used ?? 0),
+        creditAvailable: Number(dbUser.credit_limit ?? 0) - Number(dbUser.credit_used ?? 0),
+        account: profile
+      });
+    } catch (err) {
+      console.error("profile failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงข้อมูลผู้ใช้ได้" });
+    }
+  }
+  const mockUser = users.find((u) => u.username === req.session.username);
+  if (mockUser) {
+    const storedProfile = fallbackProfiles.get(mockUser.username) || {
+      full_name: "Demo User",
+      bank_name: "HSBC",
+      bank_account: "61727-9090",
+      bsb: "342252",
+      registration_no: "XX-123456"
+    };
+    return res.json({
+      id: mockUser.id,
+      username: mockUser.username,
+      role: mockUser.role,
+      creditLimit: mockUser.creditLimit,
+      creditUsed: mockUser.creditUsed,
+      creditAvailable: mockUser.creditLimit - mockUser.creditUsed,
+      account: storedProfile
+    });
+  }
+  res.json({
+    username: req.session.username,
+    role: req.session.role || "agent",
+    creditLimit: 0,
+    creditUsed: 0,
+    creditAvailable: 0,
+    account: null
+  });
+});
+
+// Minimal credit info for the logged-in user
+app.get("/api/me/credit", async (req, res) => {
+  if (req.session?.guest) {
+    return res.json({
+      creditLimit: 0,
+      creditUsed: 0,
+      creditAvailable: 0,
+      guest: true
+    });
+  }
+  if (hasDatabase()) {
+    try {
+      const dbUser = await findUserWithSecret(req.session.username);
+      if (!dbUser) return res.status(404).json({ message: "ไม่พบผู้ใช้" });
+      const creditLimit = Number(dbUser.credit_limit ?? 0);
+      const creditUsed = Number(dbUser.credit_used ?? 0);
+      const creditAvailable = creditLimit - creditUsed;
+      return res.json({ creditLimit, creditUsed, creditAvailable });
+    } catch (err) {
+      console.error("me/credit failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงข้อมูลเครดิตได้" });
+    }
+  }
+  const mockUser = users.find((u) => u.username === req.session.username);
+  if (mockUser) {
+    const creditLimit = Number(mockUser.creditLimit ?? 0);
+    const creditUsed = Number(mockUser.creditUsed ?? 0);
+    const creditAvailable = creditLimit - creditUsed;
+    return res.json({ creditLimit, creditUsed, creditAvailable });
+  }
+  res.json({ creditLimit: 0, creditUsed: 0, creditAvailable: 0 });
+});
+
+// demo fallback notifications store
+const fallbackNotifications = new Map();
+
+
+app.put("/api/profile", async (req, res) => {
+  if (req.session?.guest) {
+    return res.status(403).json({ message: "โหมดสาธิตไม่สามารถแก้ไขข้อมูลได้" });
+  }
+  if (!req.session?.userId) {
+    return res.status(401).json({ message: "กรุณาเข้าสู่ระบบอีกครั้ง" });
+  }
+  if (hasDatabase()) {
+    try {
+      const profile = await upsertUserProfile(req.session.userId, {
+        fullName: req.body.fullName,
+        bankName: req.body.bankName,
+        bankAccount: req.body.bankAccount,
+        bankBranch: req.body.bankBranch,
+        bsb: req.body.bsb,
+        registrationNo: req.body.registrationNo,
+        phone: req.body.phone
+      });
+      return res.json({ message: "บันทึกข้อมูลสำเร็จ", profile });
+    } catch (err) {
+      console.error("update profile failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถบันทึกข้อมูลได้" });
+    }
+  }
+  const payload = {
+    full_name: req.body?.fullName ?? null,
+    bank_name: req.body?.bankName ?? null,
+    bank_account: req.body?.bankAccount ?? null,
+    bank_branch: req.body?.bankBranch ?? null,
+    bsb: req.body?.bsb ?? null,
+    registration_no: req.body?.registrationNo ?? null,
+    phone: req.body?.phone ?? null
+  };
+  fallbackProfiles.set(req.session.username, payload);
+  res.json({ message: "โหมดสาธิต: จำลองการบันทึกสำเร็จ", profile: payload });
+});
+
+app.post("/api/profile/password", async (req, res) => {
+  if (req.session?.guest) {
+    return res.status(403).json({ message: "โหมดสาธิตไม่สามารถเปลี่ยนรหัสผ่านได้" });
+  }
+  if (!req.session?.userId) {
+    return res.status(401).json({ message: "กรุณาเข้าสู่ระบบอีกครั้ง" });
+  }
+  const { password } = req.body || {};
+  if (!password || password.length < 6) {
+    return res.status(400).json({ message: "รหัสผ่านต้องมีความยาวอย่างน้อย 6 ตัวอักษร" });
+  }
+  if (hasDatabase()) {
+    try {
+      const hash = crypto.createHash("sha256").update(password).digest("hex");
+      await updateUserPassword(req.session.userId, hash);
+      return res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ" });
+    } catch (err) {
+      console.error("change password failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถเปลี่ยนรหัสผ่านได้" });
+    }
+  }
+  res.json({ message: "โหมดสาธิต: เปลี่ยนรหัสผ่านสำเร็จ (จำลอง)" });
+});
+
+app.get("/api/promotions", async (req, res) => {
+  if (hasDatabase()) {
+    try {
+      const promos = await listPromotions();
+      return res.json(promos);
+    } catch (err) {
+      console.error("promotions failed:", err);
+    }
+  }
+  res.json(fallbackPromotions);
+});
+
+app.get("/api/live", async (req, res) => {
+  if (hasDatabase()) {
+    try {
+      const enabled = await getLiveSetting();
+      return res.json({ enabled });
+    } catch (err) {
+      console.error("live status failed:", err);
+    }
+  }
+  res.json({ enabled: fallbackLiveEnabled });
+});
+
+app.get("/api/wallet/transactions", async (req, res) => {
+  if (req.session?.guest) return res.json([]);
+  if (hasDatabase()) {
+    try {
+      const rows = await listTransactions({ userId: req.session.userId, limit: 100 });
+      return res.json(rows);
+    } catch (err) {
+      if (err.code !== "TRANSACTIONS_UNAVAILABLE") {
+        console.error("transactions failed:", err);
+      }
+    }
+  }
+  const records = fallbackTransactions.filter((txn) => txn.username === req.session.username).slice(-100).reverse();
+  res.json(records);
+});
+
+// optional multipart parser for deposit (handles FormData with "slip")
+const depositUpload = (req, res, next) => {
+  const contentType = req.headers["content-type"] || "";
+  if (contentType.startsWith("multipart/form-data")) {
+    return upload.single("slip")(req, res, next);
+  }
+  return next();
+};
+
+app.post("/api/wallet/deposit", depositUpload, async (req, res) => {
+  if (req.session?.guest) return res.status(403).json({ message: "โหมดสาธิต" });
+  const amount = Number(req.body?.amount ?? 0);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ message: "จำนวนเงินไม่ถูกต้อง" });
+  }
+  const note = req.body?.note ?? "";
+  if (hasDatabase()) {
+    try {
+      const record = await recordTransaction({ userId: req.session.userId, type: "deposit", amount, note });
+      return res.status(201).json(record);
+    } catch (err) {
+      if (err.code === "TRANSACTIONS_UNAVAILABLE") {
+        console.warn("transactions table unavailable, using fallback deposit log");
+      } else {
+      console.error("deposit request failed:", err);
+        return res.status(500).json({ message: "ไม่สามารถส่งคำขอฝากได้" });
+      }
+    }
+  }
+  fallbackTransactions.push({
+    id: `demo-${Date.now()}`,
+    username: req.session.username,
+    txn_type: "deposit",
+    status: "pending",
+    amount,
+    note,
+    created_at: new Date().toISOString()
+  });
+  res.status(201).json({ message: "บันทึกคำขอฝาก (สาธิต)" });
+});
+
+app.post("/api/wallet/withdraw", async (req, res) => {
+  if (req.session?.guest) return res.status(403).json({ message: "โหมดสาธิต" });
+  const amount = Number(req.body?.amount ?? 0);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ message: "จำนวนเงินไม่ถูกต้อง" });
+  }
+  const userNote = (req.body?.note || "").trim();
+  const note = userNote || null;
+  if (hasDatabase()) {
+    try {
+      const dbUser = await findUserWithSecret(req.session.username);
+      if (!dbUser) return res.status(404).json({ message: "ไม่พบผู้ใช้" });
+      const creditLimit = Number(dbUser.credit_limit ?? 0);
+      const creditUsed = Number(dbUser.credit_used ?? 0);
+      const available = creditLimit - creditUsed;
+      if (amount > available) {
+        return res.status(400).json({ message: "เครดิตไม่เพียงพอ" });
+      }
+      // lock credit while pending by reducing credit_limit
+      await pool.query("UPDATE users SET credit_limit = credit_limit - $1 WHERE id = $2", [amount, req.session.userId]);
+      const record = await recordTransaction({ userId: req.session.userId, type: "withdraw", amount, note });
+      return res.status(201).json(record);
+    } catch (err) {
+      if (err.code === "TRANSACTIONS_UNAVAILABLE") {
+        console.warn("transactions table unavailable, using fallback withdraw log");
+      } else {
+      console.error("withdraw request failed:", err);
+        const status = err.message?.includes("เครดิต") ? 400 : 500;
+        return res.status(status).json({ message: err.message || "ไม่สามารถส่งคำขอถอนได้" });
+      }
+    }
+  }
+  // fallback mode
+  const demoUser = users.find((u) => u.username === req.session.username);
+  if (!demoUser) return res.status(400).json({ message: "ไม่พบผู้ใช้" });
+  const available = Number(demoUser.creditLimit ?? 0) - Number(demoUser.creditUsed ?? 0);
+  if (amount > available) {
+    return res.status(400).json({ message: "เครดิตไม่เพียงพอ" });
+  }
+  // lock credit
+  demoUser.creditLimit = Number(demoUser.creditLimit ?? 0) - amount;
+  fallbackTransactions.push({
+    id: `demo-${Date.now()}`,
+    username: req.session.username,
+    txn_type: "withdraw",
+    status: "pending",
+    amount,
+    note,
+    created_at: new Date().toISOString()
+  });
+  res.status(201).json({ message: "บันทึกคำขอถอน (สาธิต)" });
+});
+
+app.get("/api/highlights", (req, res) => {
+  res.json(highlightSeed);
+});
+
+app.get("/api/chat", async (req, res) => {
+  if (req.session?.guest) return res.json([]);
+  if (hasDatabase()) {
+    try {
+      const rows = await listChatMessages(req.session.userId);
+      return res.json(rows);
+    } catch (err) {
+      if (err.code !== "CHAT_TABLE_UNAVAILABLE") {
+        console.error("chat list failed:", err);
+        return res.status(500).json({ message: "ไม่สามารถดึงประวัติแชทได้" });
+      }
+    }
+  }
+  res.json(getFallbackChatHistory(req.session.username));
+});
+
+app.post("/api/chat", async (req, res) => {
+  if (req.session?.guest) return res.status(403).json({ message: "โหมดสาธิต" });
+  const message = (req.body?.message || "").trim();
+  if (!message) return res.status(400).json({ message: "กรุณากรอกข้อความ" });
+  if (hasDatabase()) {
+    try {
+      const record = await appendChatMessage({ userId: req.session.userId, sender: "user", message });
+      return res.status(201).json(record);
+    } catch (err) {
+      if (err.code !== "CHAT_TABLE_UNAVAILABLE") {
+        console.error("chat append failed:", err);
+        return res.status(500).json({ message: "ไม่สามารถส่งข้อความได้" });
+      }
+    }
+  }
+  const record = appendFallbackChatMessage(req.session.username, "user", message);
+  res.status(201).json(record);
+});
+
+app.get("/api/admin/chat/threads", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  if (hasDatabase()) {
+    try {
+      const rows = await listChatThreads();
+      return res.json(rows);
+    } catch (err) {
+      if (err.code !== "CHAT_TABLE_UNAVAILABLE") {
+        console.error("chat threads failed:", err);
+      }
+      const demoThreads = Array.from(fallbackChatThreads.entries()).map(([username, messages]) => ({
+        username,
+        updated_at: messages.at(-1)?.created_at ?? null
+      }));
+      return res.json(demoThreads);
+    }
+  }
+  const demoThreads = Array.from(fallbackChatThreads.entries()).map(([username, messages]) => ({
+    username,
+    updated_at: messages.at(-1)?.created_at ?? null
+  }));
+  res.json(demoThreads);
+});
+
+app.get("/api/admin/chat/:username", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  if (hasDatabase()) {
+    try {
+      const dbUser = await findUserWithSecret(req.params.username);
+      if (!dbUser) return res.status(404).json({ message: "ไม่พบผู้ใช้" });
+      const rows = await listChatMessages(dbUser.id);
+      return res.json(rows);
+    } catch (err) {
+      if (err.code !== "CHAT_TABLE_UNAVAILABLE") {
+        console.error("chat detail failed:", err);
+        return res.status(500).json({ message: "ไม่สามารถดึงแชทได้" });
+      }
+    }
+  }
+  res.json(getFallbackChatHistory(req.params.username));
+});
+
+app.post("/api/admin/chat/:username", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const message = (req.body?.message || "").trim();
+  if (!message) return res.status(400).json({ message: "กรุณากรอกข้อความ" });
+  if (hasDatabase()) {
+    try {
+      const dbUser = await findUserWithSecret(req.params.username);
+      if (!dbUser) return res.status(404).json({ message: "ไม่พบผู้ใช้" });
+      const record = await appendChatMessage({ userId: dbUser.id, sender: "admin", message });
+      return res.status(201).json(record);
+    } catch (err) {
+      if (err.code !== "CHAT_TABLE_UNAVAILABLE") {
+        console.error("chat reply failed:", err);
+        return res.status(500).json({ message: "ไม่สามารถส่งข้อความได้" });
+      }
+    }
+  }
+  const record = appendFallbackChatMessage(req.params.username, "admin", message);
+  res.status(201).json(record);
+});
+
+app.post("/api/admin/live", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const enabled = Boolean(req.body?.enabled);
+  if (hasDatabase()) {
+    try {
+      await setLiveSetting(enabled);
+      return res.json({ enabled });
+    } catch (err) {
+      console.error("update live failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถอัปเดตสถานะไลฟ์ได้" });
+    }
+  }
+  fallbackLiveEnabled = enabled;
+  res.json({ enabled });
+});
+
+app.get("/api/lotteries", (req, res) => {
+  res.json(lotteries);
+});
+
+app.get("/api/lotteries/:id", (req, res) => {
+  const lottery = lotteries.find((l) => l.id === req.params.id);
+  if (!lottery) {
+    return res.status(404).json({ message: "ไม่พบหวยที่ต้องการ" });
+  }
+  res.json(lottery);
+});
+
+app.get("/api/lotteries/:id/payout-rates", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.json([]);
+  }
+  try {
+    const rows = await fetchPayoutRates(req.params.id);
+    res.json(rows);
+  } catch (err) {
+    console.error("client payout failed:", err);
+    res.status(500).json({ message: "ไม่สามารถดึงเรตจ่ายได้" });
+  }
+});
+
+app.get("/api/lotteries/:id/restrictions", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.json([]);
+  }
+  try {
+    const rows = await listNumberRestrictions({ lotteryCode: req.params.id });
+    res.json(rows);
+  } catch (err) {
+    console.error("client restrictions failed:", err);
+    res.status(500).json({ message: "ไม่สามารถดึงเลขอั้นได้" });
+  }
+});
+
+app.post("/api/admin/lotteries/:id/status", (req, res) => {
+  const lottery = lotteries.find((l) => l.id === req.params.id);
+  if (!lottery) {
+    return res.status(404).json({ message: "ไม่พบหวยที่ต้องการ" });
+  }
+  const { status, openTime, closeTime, note } = req.body || {};
+  if (status && ["open", "closed"].includes(status)) {
+    lottery.status = status;
+  }
+  if (openTime) {
+    lottery.openTime = openTime;
+  }
+  if (closeTime) {
+    lottery.closeTime = closeTime;
+  }
+  if (note) {
+    lottery.note = note;
+  }
+  res.json(lottery);
+});
+
+// Admin: create or update lottery definition
+app.post("/api/admin/lotteries", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const payload = req.body || {};
+  if (!payload.code || !payload.name) {
+    return res.status(400).json({ message: "กรุณาระบุ code และ name" });
+  }
+  if (hasDatabase()) {
+    try {
+      const saved = await upsertLottery(payload);
+      return res.status(201).json(saved);
+    } catch (err) {
+      console.error("upsert lottery failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถบันทึกหวยใหม่ได้" });
+    }
+  }
+  // fallback mode: update in-memory seed
+  const existing = lotteries.find((l) => l.id === payload.code);
+  if (existing) {
+    existing.name = payload.name;
+    existing.openTime = payload.openTime ?? existing.openTime;
+    existing.closeTime = payload.closeTime ?? existing.closeTime;
+    existing.status = payload.status ?? existing.status;
+    existing.description = payload.description ?? existing.description;
+  } else {
+    lotteries.push({
+      id: payload.code,
+      name: payload.name,
+      type: payload.kind || "international",
+      group: payload.group || "อื่นๆ",
+      status: payload.status || "open",
+      openTime: payload.openTime || new Date().toISOString(),
+      closeTime: payload.closeTime || new Date().toISOString(),
+      description: payload.description || ""
+    });
+  }
+  res.status(201).json(lotteries.find((l) => l.id === payload.code));
+});
+
+app.post("/api/purchases", async (req, res) => {
+  const { lotteryId, bets, amount, meta, promotionCode } = req.body;
+  if (!lotteryId || !Array.isArray(bets) || !bets.length || !amount) {
+    return res.status(400).json({ message: "กรอกข้อมูลโพยให้ครบถ้วน" });
+  }
+
+  if (req.session?.role === "admin") {
+    return res.status(403).json({ message: "บัญชีผู้ดูแลระบบไม่อนุญาตให้แทงหวย" });
+  }
+
+  const lottery = lotteries.find((l) => l.id === lotteryId);
+  if (!lottery) {
+    return res.status(404).json({ message: "ไม่พบหวยที่ต้องการ" });
+  }
+
+  if (lottery.status === "closed") {
+    return res.status(400).json({ message: "หวยปิดรับแทงแล้ว" });
+  }
+
+  let promoInfo = null;
+  if (promotionCode) {
+    if (hasDatabase()) {
+      try {
+        const promos = await listPromotions();
+        promoInfo = promos.find((p) => p.code === promotionCode);
+      } catch (err) {
+        console.error("promo lookup failed:", err);
+      }
+    }
+    if (!promoInfo) {
+      promoInfo = fallbackPromotions.find((p) => p.code === promotionCode);
+    }
+  }
+  if (!promoInfo && promotionCode) {
+    return res.status(400).json({ message: "ไม่พบโปรโมชันที่เลือก" });
+  }
+  const discountPercent = Number(promoInfo?.discount_percent ?? 0);
+  const netAmount = Math.max(0, Number(amount) * (1 - discountPercent / 100));
+
+  let creditSnapshot = null;
+  let profileAfterPurchase = null;
+  if (hasDatabase()) {
+    try {
+      // หักวงเงินคงเหลือ (credit_limit) ตามยอดสุทธิที่ซื้อ
+      const { rows } = await pool.query("SELECT id, credit_limit, credit_used FROM users WHERE id = $1", [req.session.userId]);
+      if (!rows?.length) {
+        return res.status(404).json({ message: "ไม่พบข้อมูลผู้ใช้" });
+      }
+      const creditLimit = Number(rows[0].credit_limit ?? 0);
+      const creditUsed = Number(rows[0].credit_used ?? 0);
+      const available = creditLimit - creditUsed;
+      if (netAmount > available + 1e-6) {
+        return res.status(400).json({ message: "เครดิตไม่เพียงพอ" });
+      }
+      const nextLimit = creditLimit - netAmount;
+      await pool.query("UPDATE users SET credit_limit = $2 WHERE id = $1", [req.session.userId, nextLimit]);
+      creditSnapshot = {
+        creditLimit: nextLimit,
+        creditUsed,
+        creditAvailable: nextLimit - creditUsed
+      };
+      profileAfterPurchase = {
+        id: rows[0].id,
+        username: req.session.username,
+        role: req.session.role,
+        creditLimit: nextLimit,
+        creditUsed,
+        creditAvailable: nextLimit - creditUsed
+      };
+    } catch (err) {
+      if (err.message === "ยอดเครดิตไม่เพียงพอ") {
+        return res.status(400).json({ message: "เครดิตไม่เพียงพอ" });
+      }
+      console.error("adjust user credit failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถตัดเครดิตได้" });
+    }
+  } else {
+    const fallbackUser = users.find((u) => u.username === req.session.username);
+    if (!fallbackUser) {
+      return res.status(400).json({ message: "ไม่พบข้อมูลผู้ใช้" });
+    }
+    const creditLimit = Number(fallbackUser.creditLimit ?? 0);
+    const creditUsed = Number(fallbackUser.creditUsed ?? 0);
+    const available = creditLimit - creditUsed;
+    if (netAmount > available + 1e-6) {
+      return res.status(400).json({ message: "เครดิตไม่เพียงพอ" });
+    }
+    fallbackUser.creditLimit = creditLimit - netAmount;
+    creditSnapshot = {
+      creditLimit: fallbackUser.creditLimit,
+      creditUsed: fallbackUser.creditUsed,
+      creditAvailable: fallbackUser.creditLimit - fallbackUser.creditUsed
+    };
+    profileAfterPurchase = {
+      id: fallbackUser.id,
+      username: fallbackUser.username,
+      role: fallbackUser.role,
+      creditLimit: fallbackUser.creditLimit,
+      creditUsed: fallbackUser.creditUsed,
+      creditAvailable: fallbackUser.creditLimit - fallbackUser.creditUsed
+    };
+  }
+
+  const grossAmount = Number(amount) || 0;
+  const scaleFactor = grossAmount > 0 ? netAmount / grossAmount : 1;
+  const metaItems = Array.isArray(meta?.items) ? meta.items : [];
+  const betTypeLabelMap = {
+  "three-top": "3 ตัวบน",
+  "three-tod": "3 ตัวโต๊ด",
+  "three-bottom": "3 ตัวล่าง",
+  "three-front": "3 หัว",
+  "three-front-tod": "3 หัวโต๊ด",
+  "two-top": "2 ตัวบน",
+  "two-bottom": "2 ตัวล่าง",
+  "run-top": "วิ่งบน",
+  "run-bottom": "วิ่งล่าง",
+  standard: "สองตัว · 2 ตัวบน"
+  };
+  const normalizedItems =
+    metaItems.length > 0
+      ? metaItems.map((it) => ({
+          ...it,
+          amount: Number(it.amount ?? 0) * scaleFactor,
+          betType: it.betType || meta?.betTypes?.[0] || "standard",
+          betTypeLabel: it.betTypeLabel || betTypeLabelMap[it.betType] || betTypeLabelMap.standard
+        }))
+      : (bets || []).map((num) => ({
+          id: `${num}-${Date.now()}`,
+          number: num,
+          amount: netAmount && bets?.length ? netAmount / bets.length : 0,
+          betType: meta?.betTypes?.[0] || "standard",
+          betTypeLabel: betTypeLabelMap[meta?.betTypes?.[0]] || betTypeLabelMap.standard
+        }));
+
+  const createdAt = new Date().toISOString();
+  const drawDate = resolveDrawDateForLottery(lotteryId, createdAt);
+  const ticket = {
+    id: nanoid(8),
+    member: req.session.username,
+    lotteryId,
+    betNumbers: bets,
+    amount: netAmount,
+    items: normalizedItems,
+    promotionCode: promoInfo?.code ?? null,
+    potentialPayout: amount * 9,
+    status: "pending",
+    createdAt,
+    drawDate
+  };
+
+  // Resolve a default payout rate for this ticket (for DB persistence and admin review)
+  let defaultPayoutRate = null;
+  if (hasDatabase()) {
+    try {
+      const [rates, restrictions] = await Promise.all([
+        fetchPayoutRates(lotteryId).catch(() => []),
+        listNumberRestrictions({ lotteryCode: lotteryId }).catch(() => [])
+      ]);
+      const resolveRate = (betType, number) => {
+        const targetLottery = (lotteryId || "").toLowerCase();
+        const candidates = (restrictions || []).filter((nr) => {
+          const sameLottery = !nr.lotteryCode || nr.lotteryCode === "all" || targetLottery === (nr.lotteryCode || "").toLowerCase();
+          const sameBet = !nr.betType || nr.betType === betType;
+          return sameLottery && sameBet;
+        });
+        const matchesPattern = (pattern, value) => {
+          const raw = String(pattern || "").trim();
+          const val = String(value || "").trim();
+          if (!raw || !val) return false;
+          if (raw === "*") return true;
+          if (raw.includes(",")) return raw.split(",").map((p) => p.trim()).filter(Boolean).some((p) => matchesPattern(p, val));
+          if (raw.includes("-")) {
+            const [a, b] = raw.split("-").map((p) => Number(p.trim()));
+            const n = Number(val);
+            if (Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(n)) {
+              const min = Math.min(a, b);
+              const max = Math.max(a, b);
+              return n >= min && n <= max;
+            }
+          }
+          return raw === val;
+        };
+        // highest priority: literal exact match (no wildcard/range)
+        const literal = candidates.find((nr) => {
+          const raw = String(nr.number || "").trim();
+          if (!raw || raw === "*" || raw.includes(",") || raw.includes("-")) return false;
+          return raw === String(number || "").trim() && nr.payoutRate != null;
+        });
+        if (literal) return Number(literal.payoutRate);
+        const exact = candidates.find((nr) => nr.number && nr.number !== "*" && matchesPattern(nr.number, number) && nr.payoutRate != null);
+        if (exact) return Number(exact.payoutRate);
+        const wildcard = candidates.find((nr) => String(nr.number || "").trim() === "*" && nr.payoutRate != null);
+        if (wildcard) return Number(wildcard.payoutRate);
+        const byType = rates.find((r) => r.betType === betType);
+        if (byType) return Number(byType.rate);
+        return null;
+      };
+      const resolvedItems = (normalizedItems || []).map((it) => {
+        const rate = resolveRate(it.betType, it.number);
+        return { ...it, payoutRate: rate ?? it.payoutRate ?? null };
+      });
+      ticket.items = resolvedItems;
+      defaultPayoutRate = resolvedItems[0]?.payoutRate ?? null;
+      ticket.payoutRate = defaultPayoutRate;
+    } catch (err) {
+      console.warn("resolve payout rate failed:", err.message || err);
+    }
+  }
+
+  purchaseHistory.unshift(ticket);
+
+  if (hasDatabase()) {
+    try {
+      const betType = meta?.betTypes?.[0] ?? meta?.betType ?? "manual";
+      const saved = await saveTicketRecord({
+        username: req.session.username,
+        lotteryCode: lotteryId,
+        betType,
+        numbers: JSON.stringify(bets),
+        amount: netAmount,
+        status: ticket.status,
+        payoutRate: defaultPayoutRate ?? null,
+        promotionCode: promoInfo?.code ?? null,
+        drawDate
+      });
+      try {
+        await Promise.all(
+          (ticket.items || []).map((it) =>
+            logPurchase({
+              ticketId: saved?.ticketId ?? null,
+              userId: saved?.userId ?? null,
+              lotteryCode: lotteryId,
+              betType: it.betType || betType,
+              numbers: it.number,
+              amount: Number(it.amount ?? 0),
+              payoutRate: it.payoutRate ?? null,
+              drawDate
+            })
+          )
+        );
+      } catch (err) {
+        console.error("Failed to persist purchase log:", err.message);
+      }
+    } catch (err) {
+      console.error("Failed to persist purchase log:", err.message);
+    }
+  }
+
+  res.status(201).json({ ...ticket, creditSnapshot, profile: profileAfterPurchase });
+});
+
+app.post("/api/tickets/:id/cancel", async (req, res) => {
+  if (!req.session?.username) return res.status(401).json({ message: "ต้องเข้าสู่ระบบก่อน" });
+  const ticketId = Number(req.params.id);
+  if (!ticketId) return res.status(400).json({ message: "ticketId ไม่ถูกต้อง" });
+  const sessionRole = (req.session?.role || "").toLowerCase();
+  const isAdmin = sessionRole.includes("admin");
+  const findLottery = (code) => lotteries.find((l) => l.id === code || l.code === code);
+
+  if (hasDatabase()) {
+    try {
+      const ticket = await fetchTicketById(ticketId);
+      if (!ticket) return res.status(404).json({ message: "ไม่พบโพย" });
+      if (!isAdmin && ticket.userId !== req.session.userId) {
+        return res.status(403).json({ message: "ไม่มีสิทธิ์ยกเลิกโพยนี้" });
+      }
+      if (String(ticket.status || "").toLowerCase() !== "pending") {
+        return res.status(400).json({ message: "โพยนี้ไม่สามารถยกเลิกได้" });
+      }
+      const drawDate = ticket.drawDate || resolveDrawDateForLottery(ticket.lotteryCode, ticket.createdAt);
+      const closeAt = resolveLotteryCloseTime(findLottery(ticket.lotteryCode), drawDate);
+      if (!closeAt) {
+        return res.status(400).json({ message: "ไม่พบเวลาปิดรับแทงของหวยนี้" });
+      }
+      const cutoff = closeAt.getTime() - CANCEL_WINDOW_MINUTES * 60 * 1000;
+      if (Date.now() >= cutoff) {
+        return res.status(400).json({ message: "เกินเวลายกเลิกโพย (ต้องก่อนหวยออก 30 นาที)" });
+      }
+      const refundAmount = Math.max(0, Number(ticket.amount ?? 0));
+      await pool.query("UPDATE tickets SET status = 'cancelled' WHERE id = $1", [ticket.id]);
+      await pool.query("UPDATE users SET credit_limit = credit_limit + $1 WHERE id = $2", [refundAmount, ticket.userId]);
+      try {
+        const logs = await fetchPurchaseLogsByTicket(ticket.id);
+        const logIds = (logs || []).map((log) => log.id).filter(Boolean);
+        if (logIds.length) {
+          await markPurchaseLogsStatus(logIds, "cancelled");
+        }
+      } catch (err) {
+        console.warn("cancel purchase logs failed:", err.message || err);
+      }
+      return res.json({ ok: true, ticketId: ticket.id, refund: refundAmount });
+    } catch (err) {
+      console.error("cancel ticket failed:", err.message || err);
+      return res.status(500).json({ message: "ไม่สามารถยกเลิกโพยได้" });
+    }
+  }
+
+  const ticket = purchaseHistory.find((t) => String(t.id) === String(ticketId));
+  if (!ticket) return res.status(404).json({ message: "ไม่พบโพย" });
+  if (!isAdmin && ticket.member !== req.session.username) {
+    return res.status(403).json({ message: "ไม่มีสิทธิ์ยกเลิกโพยนี้" });
+  }
+  if (String(ticket.status || "").toLowerCase() !== "pending") {
+    return res.status(400).json({ message: "โพยนี้ไม่สามารถยกเลิกได้" });
+  }
+  const drawDate = ticket.drawDate || resolveDrawDateForLottery(ticket.lotteryId, ticket.createdAt);
+  const closeAt = resolveLotteryCloseTime(findLottery(ticket.lotteryId), drawDate);
+  if (!closeAt) {
+    return res.status(400).json({ message: "ไม่พบเวลาปิดรับแทงของหวยนี้" });
+  }
+  const cutoff = closeAt.getTime() - CANCEL_WINDOW_MINUTES * 60 * 1000;
+  if (Date.now() >= cutoff) {
+    return res.status(400).json({ message: "เกินเวลายกเลิกโพย (ต้องก่อนหวยออก 30 นาที)" });
+  }
+  const refundAmount = Math.max(0, Number(ticket.amount ?? 0));
+  ticket.status = "cancelled";
+  const demoUser = users.find((u) => u.username === ticket.member);
+  if (demoUser) {
+    demoUser.creditLimit = Number(demoUser.creditLimit ?? 0) + refundAmount;
+  }
+  return res.json({ ok: true, ticketId: ticket.id, refund: refundAmount });
+});
+
+app.get("/api/purchases/reports", (req, res) => {
+  const { status } = req.query;
+  const sessionUser = req.session?.username;
+  const sessionRole = (req.session?.role || "").toLowerCase();
+  const isSuperAdmin = sessionRole.includes("admin");
+  if (!sessionUser) return res.status(401).json({ message: "ต้องเข้าสู่ระบบก่อน" });
+  const resultsMap = defaultResults;
+  let data = hydrateTicketsWithResults(purchaseHistory, resultsMap).filter((item) => (status ? item.status === status : true));
+  if (!isSuperAdmin) {
+    data = data.filter((item) => item.member === sessionUser);
+  }
+  res.json(data);
+});
+
+app.get("/api/admin/summary", async (req, res) => {
+  try {
+    const sessionRole = (req.session?.role || "").toLowerCase();
+    const isSuperAdmin = sessionRole.includes("admin");
+    let active = lotteries.filter((l) => l.status === "open").length;
+    const todayKey = new Date().toISOString().slice(0, 10);
+    let totalStake = purchaseHistory
+      .filter((item) => item.createdAt?.slice(0, 10) === todayKey)
+      .filter((item) => (isSuperAdmin ? true : item.member === req.session?.username))
+      .reduce((sum, item) => sum + item.amount, 0);
+    let creditStats = {
+      creditUsed: users.reduce((sum, u) => sum + u.creditUsed, 0),
+      creditLimit: users.reduce((sum, u) => sum + u.creditLimit, 0),
+      totalMembers: users.length
+    };
+    let resultPayload = defaultResults;
+
+    if (hasDatabase()) {
+      const stats = await fetchCreditSummary();
+      creditStats = {
+        creditUsed: stats.creditUsed,
+        creditLimit: stats.creditLimit,
+        totalMembers: stats.totalMembers
+      };
+      try {
+        active = await countOpenLotteries();
+      } catch (err) {
+        console.error("count lottery failed:", err.message);
+      }
+      try {
+        totalStake = await sumTicketAmount({ todayOnly: true, userId: isSuperAdmin ? undefined : req.session?.userId });
+      } catch (err) {
+        console.error("sum ticket failed:", err.message);
+      }
+      try {
+        const latest = await fetchLatestResults(["th-lottery", "lao-lottery"]);
+        if (latest && Object.keys(latest).length) {
+          resultPayload = latest;
+        }
+      } catch (err) {
+        console.error("fetch results failed:", err.message);
+      }
+    }
+
+    res.json({
+      activeLotteries: active,
+      todayStake: totalStake,
+      creditUsed: creditStats.creditUsed,
+      creditLimit: creditStats.creditLimit,
+      totalMembers: creditStats.totalMembers,
+      announcements,
+      results: resultPayload
+    });
+  } catch (err) {
+    console.error("summary failed:", err);
+    res.status(500).json({ message: "ไม่สามารถดึงข้อมูลสรุปได้" });
+  }
+});
+
+app.get("/api/admin/members", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.json(users);
+  }
+  try {
+    const rows = await listUsers();
+    res.json(rows);
+  } catch (err) {
+    console.error("members failed:", err);
+    res.status(500).json({ message: "ไม่สามารถดึงข้อมูลสมาชิกได้" });
+  }
+});
+
+app.get("/api/admin/credit-ledger", async (req, res) => {
+  const sessionRole = (req.session?.role || "").toLowerCase();
+  const isSuperAdmin = sessionRole.includes("admin");
+  const userMap = new Map();
+  const requestedFilter = (req.query?.username || "").toLowerCase();
+  const selfFilter = (req.session?.username || "").toLowerCase();
+  const enforceFilter = isSuperAdmin ? requestedFilter : selfFilter;
+  if (!req.session?.username) return res.status(401).json({ message: "ต้องเข้าสู่ระบบก่อน" });
+
+  // Utilities for draw date alignment and win detection
+  const normalizeDrawDate = (lotteryId, createdAt) => {
+    if (!createdAt) return null;
+    const base = new Date(createdAt);
+    if (Number.isNaN(base.getTime())) return null;
+    const id = (lotteryId || "").toLowerCase();
+    if (id.includes("th-lottery") || id.includes("thai")) {
+      const day = base.getDate();
+      const month = base.getMonth();
+      const year = base.getFullYear();
+      if (day <= 1) return new Date(year, month, 1).toISOString().slice(0, 10);
+      if (day <= 16) return new Date(year, month, 16).toISOString().slice(0, 10);
+      const nextMonth = month + 1;
+      const rolloverYear = nextMonth > 11 ? year + 1 : year;
+      const rolloverMonth = nextMonth > 11 ? 0 : nextMonth;
+      return new Date(rolloverYear, rolloverMonth, 1).toISOString().slice(0, 10);
+    }
+    if (id.includes("lao")) {
+      const targetDays = [1, 3, 5]; // Mon, Wed, Fri
+      const iter = new Date(base);
+      for (let i = 0; i < 7; i += 1) {
+        const dow = iter.getDay();
+        if (targetDays.includes(dow)) {
+          return new Date(iter.getFullYear(), iter.getMonth(), iter.getDate()).toISOString().slice(0, 10);
+        }
+        iter.setDate(iter.getDate() + 1);
+      }
+    }
+    return base.toISOString().slice(0, 10);
+  };
+
+  const isWinningNumber = (number, result) => {
+    if (!result || !number) return false;
+    const num = String(number).trim();
+    const { firstPrize, frontThree = [], backThree = [], twoDigits, nearFirst = [] } = result;
+    if (num.length === 6 && firstPrize && num === firstPrize) return true;
+    if (num.length === 6 && Array.isArray(nearFirst) && nearFirst.includes(num)) return true;
+    if (num.length === 3 && Array.isArray(frontThree) && frontThree.includes(num)) return true;
+    if (num.length === 3 && Array.isArray(backThree) && backThree.includes(num)) return true;
+    if (num.length === 2 && twoDigits && num === twoDigits) return true;
+    return false;
+  };
+
+  const resultsMap = hasDatabase()
+    ? await fetchLatestResults(["th-lottery", "lao-lottery"]).catch(() => defaultResults)
+    : defaultResults;
+
+  const hydrateLedger = (items) =>
+    items.map((item) => {
+      const numbers = normalizeNumberList(item.numbers ?? item.betNumbers);
+      const drawDate = normalizeDrawDate(item.lotteryId, item.drawDate ?? item.createdAt) || item.drawDate;
+      const result = resultsMap?.[item.lotteryId] || resultsMap?.[(item.lotteryId || "").toLowerCase()];
+      const isWinner = item.status === "won" || numbers.some((num) => isWinningNumber(num, result));
+      const creditValue = isWinner ? item.credit ?? item.potentialPayout ?? item.amount ?? 0 : 0;
+      return {
+        ...item,
+        numbers,
+        drawDate,
+        credit: creditValue,
+        status: isWinner ? "won" : item.status || "pending"
+      };
+    });
+
+  if (hasDatabase()) {
+    try {
+      const members = await listUsers().catch(() => []);
+      members.forEach((m) => userMap.set(String(m.username).toLowerCase(), m.username));
+      members.forEach((m) => userMap.set(String(m.id), m.username));
+      const ledger = hydrateLedger(await fetchLedger(100)).map((item) => ({
+        ...item,
+        member: userMap.get(String(item.member).toLowerCase()) || userMap.get(String(item.member)) || item.member
+      }));
+      const filtered = ledger.filter((item) => {
+        const member = (item.member || "").toLowerCase();
+        if (!isSuperAdmin) {
+          return !selfFilter || member === selfFilter;
+        }
+        if (enforceFilter) {
+          return member.includes(enforceFilter);
+        }
+        return true;
+      });
+      return res.json(filtered);
+    } catch (err) {
+      console.error("ledger failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงเดินบัญชีได้" });
+    }
+  }
+  const ledger = hydrateLedger(purchaseHistory.map((item) => ({ ...item, numbers: normalizeNumberList(item.betNumbers) }))).map((item) => ({
+    ...item,
+    member: userMap.get(String(item.member).toLowerCase()) || userMap.get(String(item.member)) || item.member
+  }));
+  const filtered = ledger.filter((item) => {
+    const member = (item.member || "").toLowerCase();
+    if (!isSuperAdmin) {
+      return !selfFilter || member === selfFilter;
+    }
+    if (enforceFilter) {
+      return member.includes(enforceFilter);
+    }
+    return true;
+  });
+  res.json(filtered);
+});
+
+app.get("/api/admin/credit-between", async (req, res) => {
+  const sessionUser = req.session?.username;
+  const sessionRole = (req.session?.role || "").toLowerCase();
+  const isSuperAdmin = sessionRole.includes("admin");
+  if (!sessionUser) return res.status(401).json({ message: "ต้องเข้าสู่ระบบก่อน" });
+  if (!hasDatabase()) {
+    const fallback = users.map((u) => ({
+      username: u.username,
+      creditLimit: u.creditLimit,
+      creditAvailable: u.creditLimit - u.creditUsed,
+      children: u.children
+    }));
+    if (!isSuperAdmin) {
+      const own = fallback.find((f) => f.username === sessionUser);
+      return res.json(own ? [own] : []);
+    }
+    return res.json(fallback);
+  }
+  try {
+    const rows = await listUsers();
+    const mapped = rows.map((u) => ({
+      username: u.username,
+      creditLimit: u.creditLimit,
+      creditAvailable: u.creditLimit - u.creditUsed,
+      children: []
+    }));
+    if (!isSuperAdmin) {
+      const own = mapped.find((m) => m.username === sessionUser);
+      return res.json(own ? [own] : []);
+    }
+    res.json(mapped);
+  } catch (err) {
+    console.error("credit-between failed:", err);
+    res.status(500).json({ message: "ไม่สามารถดึงสถานะเครดิตได้" });
+  }
+});
+
+app.get("/api/admin/daily-summary", async (req, res) => {
+  if (hasDatabase()) {
+    try {
+      const sessionRole = (req.session?.role || "").toLowerCase();
+      const isSuperAdmin = sessionRole.includes("admin");
+      const summary = await fetchDailyTicketSummary(isSuperAdmin ? null : req.session?.userId);
+      return res.json(summary);
+    } catch (err) {
+      console.error("daily summary failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงข้อมูลสรุปรายวันได้" });
+    }
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const sessionUser = req.session?.username;
+  const sessionRole = (req.session?.role || "").toLowerCase();
+  const isSuperAdmin = sessionRole.includes("admin");
+  const total = purchaseHistory.reduce(
+    (acc, item) => {
+      const dateOnly = item.createdAt.slice(0, 10);
+      if (dateOnly !== today) return acc;
+      if (!isSuperAdmin && item.member !== sessionUser) return acc;
+      acc.tickets += 1;
+      acc.amount += item.amount;
+      return acc;
+    },
+    { tickets: 0, amount: 0 }
+  );
+
+  res.json({
+    date: today,
+    totalTickets: total.tickets,
+    totalAmount: total.amount,
+    estimateRevenue: total.amount * 0.2
+  });
+});
+
+app.get("/api/admin/income-report", async (req, res) => {
+  if (hasDatabase()) {
+    try {
+      const report = await fetchIncomeReportFromDb();
+      return res.json(report);
+    } catch (err) {
+      console.error("income report failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงรายงานรายได้ได้" });
+    }
+  }
+  const income = lotteries.map((lottery) => {
+    const sessionUser = req.session?.username;
+    const sessionRole = (req.session?.role || "").toLowerCase();
+    const isSuperAdmin = sessionRole.includes("admin");
+    const related = purchaseHistory.filter((purchase) => purchase.lotteryId === lottery.id && (isSuperAdmin ? true : purchase.member === sessionUser));
+    const amount = related.reduce((sum, item) => sum + item.amount, 0);
+    return {
+      lottery: lottery.name,
+      totalStake: amount,
+      estimatedMargin: amount * 0.18
+    };
+  });
+  res.json(income);
+});
+
+app.get("/api/admin/settings", (req, res) => {
+  res.json(appSettings);
+});
+
+app.post("/api/admin/settings", (req, res) => {
+  const next = req.body || {};
+  Object.assign(appSettings, next);
+  res.json({ ...appSettings, savedAt: new Date().toISOString() });
+});
+
+app.post("/api/admin/users", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const {
+    username,
+    password,
+    role = "agent",
+    creditLimit = 0,
+    fullName,
+    bankName,
+    bankAccount,
+    bsb,
+    phone
+  } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ message: "ต้องกรอก username และ password" });
+  }
+  try {
+    const passwordHash = crypto.createHash("sha256").update(password).digest("hex");
+    const normalizedRole = role === "user" ? "agent" : role;
+    const user = await createUserAccount({ username, passwordHash, role: normalizedRole, creditLimit: Number(creditLimit) || 0 });
+    // บันทึกโปรไฟล์เพิ่มเติม (ชื่อบัญชี/ธนาคาร/เบอร์/bsb)
+    if (fullName || bankName || bankAccount || bsb || phone) {
+      try {
+        await upsertUserProfile(user.id, {
+          fullName: fullName ?? null,
+          bankName: bankName ?? null,
+          bankAccount: bankAccount ?? null,
+          bsb: bsb ?? null,
+          phone: phone ?? null
+        });
+      } catch (e) {
+        console.error("save user profile failed:", e.message || e);
+      }
+    }
+    res.status(201).json(user);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "ไม่สามารถสร้างผู้ใช้ได้", error: err.message });
+  }
+});
+
+app.patch("/api/admin/users/:id/credit", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const userId = Number(req.params.id);
+  if (!userId) {
+    return res.status(400).json({ message: "ระบุรหัสผู้ใช้ไม่ถูกต้อง" });
+  }
+  try {
+    const topupAmount =
+      typeof req.body.topupAmount === "number" ? req.body.topupAmount : undefined;
+    await updateUserCredit(userId, {
+      creditLimit: typeof req.body.creditLimit === "number" ? req.body.creditLimit : undefined,
+      creditUsed: typeof req.body.creditUsed === "number" ? req.body.creditUsed : undefined,
+      topupAmount
+    });
+    if (typeof topupAmount === "number" && topupAmount > 0) {
+      const targetUsername = await resolveUsernameById(userId);
+      await appendAuditLogEntry({
+        action: "credit_topup",
+        actorId: req.session?.userId ?? null,
+        actorUsername: req.session?.username ?? null,
+        targetUserId: userId,
+        targetUsername: targetUsername ?? null,
+        amount: topupAmount,
+        status: "approved"
+      });
+    }
+    res.json({ message: "อัปเดตเครดิตสำเร็จ" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "ไม่สามารถอัปเดตเครดิตได้", error: err.message });
+  }
+});
+
+app.post("/api/admin/users/:id/deposit", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const userId = Number(req.params.id);
+  const amount = Number(req.body?.amount ?? 0);
+  if (!userId || amount <= 0) {
+    return res.status(400).json({ message: "ข้อมูลไม่ถูกต้อง" });
+  }
+  try {
+    await pool.query("UPDATE users SET credit_limit = credit_limit + $1 WHERE id = $2", [amount, userId]);
+    const { rows } = await pool.query("SELECT credit_limit, credit_used FROM users WHERE id = $1", [userId]);
+    const creditLimit = Number(rows?.[0]?.credit_limit ?? 0);
+    const creditUsed = Number(rows?.[0]?.credit_used ?? 0);
+    const targetUsername = await resolveUsernameById(userId);
+    await appendAuditLogEntry({
+      action: "admin_deposit",
+      actorId: req.session?.userId ?? null,
+      actorUsername: req.session?.username ?? null,
+      targetUserId: userId,
+      targetUsername: targetUsername ?? null,
+      amount,
+      status: "approved"
+    });
+    res.json({
+      message: "ฝากเครดิตสำเร็จ",
+      creditUsed,
+      creditLimit,
+      creditAvailable: creditLimit - creditUsed
+    });
+  } catch (err) {
+    console.error("deposit failed:", err);
+    res.status(400).json({ message: err.message || "ไม่สามารถฝากเครดิตได้" });
+  }
+});
+
+app.post("/api/admin/users/:id/withdraw", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const userId = Number(req.params.id);
+  const amount = Number(req.body?.amount ?? 0);
+  if (!userId || amount <= 0) {
+    return res.status(400).json({ message: "ข้อมูลไม่ถูกต้อง" });
+  }
+  try {
+    const result = await adjustUserCreditUsage(userId, amount);
+    const targetUsername = await resolveUsernameById(userId);
+    await appendAuditLogEntry({
+      action: "admin_withdraw",
+      actorId: req.session?.userId ?? null,
+      actorUsername: req.session?.username ?? null,
+      targetUserId: userId,
+      targetUsername: targetUsername ?? null,
+      amount,
+      status: "approved"
+    });
+    res.json({
+      message: "ถอนเครดิตสำเร็จ",
+      creditUsed: result.creditUsed,
+      creditLimit: result.creditLimit,
+      creditAvailable: result.creditAvailable
+    });
+  } catch (err) {
+    console.error("withdraw failed:", err);
+    const status = err.message === "ยอดเครดิตไม่เพียงพอ" ? 400 : 500;
+    res.status(status).json({ message: err.message || "ไม่สามารถถอนเครดิตได้" });
+  }
+});
+
+app.get("/api/admin/payout-rates/:lotteryCode", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  try {
+    const rows = await fetchPayoutRates(req.params.lotteryCode);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "ไม่สามารถดึงข้อมูลเรตจ่ายได้" });
+  }
+});
+
+app.get("/api/admin/transactions", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  if (hasDatabase()) {
+    try {
+      const rows = await listTransactions({ limit: 200 });
+      return res.json(rows);
+    } catch (err) {
+      if (err.code !== "TRANSACTIONS_UNAVAILABLE") {
+        console.error("admin transactions failed:", err);
+      }
+      return res.json(fallbackTransactions.slice(-200).reverse());
+    }
+  }
+  res.json(fallbackTransactions.slice(-200).reverse());
+});
+
+app.get("/api/admin/credit-history", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const allowedActions = new Set([
+    "credit_topup",
+    "admin_deposit",
+    "admin_withdraw",
+    "transaction_approved",
+    "transaction_rejected"
+  ]);
+  if (hasDatabase()) {
+    try {
+      const rows = await listAuditLogs({ limit: 200 });
+      const filtered = rows.filter((row) => allowedActions.has(row.action)).map(normalizeAuditEntry);
+      return res.json(filtered);
+    } catch (err) {
+      if (err.code !== "AUDIT_LOG_UNAVAILABLE") {
+        console.error("admin credit history failed:", err);
+      }
+    }
+  }
+  const fallback = fallbackAuditLogs
+    .filter((row) => allowedActions.has(row.action))
+    .slice(0, 200)
+    .map(normalizeAuditEntry);
+  res.json(fallback);
+});
+
+// Admin: approve a transaction (deposit/withdraw)
+app.post("/api/admin/transactions/:id/approve", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ message: "ระบุ id ให้ถูกต้อง" });
+  if (hasDatabase()) {
+    try {
+      const txn = await fetchTransactionById(id);
+      if (!txn) return res.status(404).json({ message: "ไม่พบธุรกรรม" });
+      if (txn.status === "approved") return res.status(400).json({ message: "ธุรกรรมได้รับการอนุมัติแล้ว" });
+
+      const amountNum = Number(txn.amount);
+      const txnType = String(txn.txnType || txn.txn_type || "").toLowerCase();
+      const isWithdraw = txnType === "withdraw";
+      const isDeposit = txnType === "deposit";
+      // ฝาก: เพิ่มวงเงิน (credit_limit) ไม่ไปหัก credit_used เดิม
+      if (isDeposit) {
+        // ฝาก: เพิ่มวงเงิน (credit_limit) ไม่ไปหัก credit_used เดิม
+        await pool.query("UPDATE users SET credit_limit = credit_limit + $1 WHERE id = $2", [amountNum, txn.userId]);
+      } else if (!isWithdraw) {
+        console.warn(`Unknown transaction type "${txnType}" for id=${id}, skipping credit adjustment`);
+      }
+      await updateTransactionStatus(id, "approved");
+      // notify user
+      const type = isWithdraw ? "withdraw" : isDeposit ? "deposit" : "transaction";
+      const title = isWithdraw ? "ถอนเงินอนุมัติ" : isDeposit ? "ฝากเงินอนุมัติ" : "อัปเดตสถานะธุรกรรม";
+      const message =
+        isWithdraw
+          ? `คำขอถอน ${txn.amount}  ได้รับการอนุมัติ`
+          : isDeposit
+            ? `เงินฝาก ${txn.amount}  ได้รับการอนุมัติ`
+            : `ธุรกรรม ${txn.amount} ได้รับการอัปเดตเป็น Approved`;
+      try {
+        await createNotification({
+          userId: txn.userId,
+          type,
+          title,
+          message,
+          meta: { transactionId: id, amount: txn.amount }
+        });
+      } catch (e) {
+        console.error("notify failed", e);
+      }
+      const targetUsername = await resolveUsernameById(txn.userId);
+      await appendAuditLogEntry({
+        action: "transaction_approved",
+        actorId: req.session?.userId ?? null,
+        actorUsername: req.session?.username ?? null,
+        targetUserId: txn.userId,
+        targetUsername: targetUsername ?? null,
+        amount: amountNum,
+        txnType,
+        status: "approved",
+        transactionId: id,
+        note: txn.note ?? null
+      });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("approve txn failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถอนุมัติธุรกรรมได้" });
+    }
+  }
+  // demo fallback
+  const idx = fallbackTransactions.findIndex((t) => String(t.id) === String(id));
+  if (idx === -1) return res.status(404).json({ message: "ไม่พบธุรกรรม" });
+  const txn = fallbackTransactions[idx];
+  if (txn.status === "approved") return res.status(400).json({ message: "ธุรกรรมได้รับการอนุมัติแล้ว" });
+  txn.status = "approved";
+  // apply credit to demo user
+  const demoUser = users.find((u) => u.username === txn.username);
+  if (demoUser) {
+    const txnType = String(txn.txn_type || txn.txnType || "").toLowerCase();
+    const isWithdraw = txnType === "withdraw";
+    const isDeposit = txnType === "deposit";
+    // ถอน: วงเงินถูกล็อกไว้ตอนสร้างคำขอแล้ว จึงไม่ต้องขยับอีก
+    if (isDeposit) {
+      demoUser.creditLimit = Number(demoUser.creditLimit ?? 0) + Number(txn.amount);
+    } else if (!isWithdraw) {
+      console.warn(`Unknown transaction type "${txnType}" for demo transaction id=${id}, skipping credit adjustment`);
+    }
+    const list = fallbackNotifications.get(demoUser.username) || [];
+    const type = isWithdraw ? "withdraw" : isDeposit ? "deposit" : "transaction";
+    const title = isWithdraw ? "ถอนเงินอนุมัติ" : isDeposit ? "ฝากเงินอนุมัติ" : "อัปเดตสถานะธุรกรรม";
+    const message =
+      isWithdraw
+        ? `คำขอถอน ${txn.amount}  ได้รับการอนุมัติ`
+        : isDeposit
+          ? `เงินฝาก ${txn.amount}  ได้รับการอนุมัติ`
+          : `ธุรกรรม ${txn.amount} ได้รับการอัปเดตเป็น Approved`;
+    list.unshift({
+      id: `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      type,
+      title,
+      message,
+      meta: { transactionId: txn.id, amount: txn.amount },
+      read: false,
+      createdAt: new Date().toISOString()
+    });
+    fallbackNotifications.set(demoUser.username, list);
+  }
+  await appendAuditLogEntry({
+    action: "transaction_approved",
+    actorId: req.session?.userId ?? null,
+    actorUsername: req.session?.username ?? null,
+    targetUserId: demoUser?.id ?? null,
+    targetUsername: txn.username ?? demoUser?.username ?? null,
+    amount: Number(txn.amount),
+    txnType: String(txn.txn_type || txn.txnType || "").toLowerCase(),
+    status: "approved",
+    transactionId: id,
+    note: txn.note ?? null
+  });
+  return res.json({ ok: true });
+});
+
+// Admin: reject a transaction
+app.post("/api/admin/transactions/:id/reject", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ message: "ระบุ id ให้ถูกต้อง" });
+  const reason = req.body?.reason ?? null;
+  if (hasDatabase()) {
+    try {
+      const txn = await fetchTransactionById(id);
+      if (!txn) return res.status(404).json({ message: "ไม่พบธุรกรรม" });
+      await updateTransactionStatus(id, 'rejected');
+      // if withdraw was pending, restore locked credit
+      const txnType = String(txn.txnType || txn.txn_type || "").toLowerCase();
+      if (txnType === 'withdraw') {
+        try {
+          await pool.query("UPDATE users SET credit_limit = credit_limit + $1 WHERE id = $2", [txn.amount, txn.userId]);
+        } catch (err) {
+          console.error("refund locked credit failed:", err.message || err);
+        }
+      }
+      const type = txn.txnType === 'withdraw' ? 'withdraw' : 'deposit';
+      const title = txn.txnType === 'withdraw' ? 'ถอนเงินไม่อนุมัติ' : 'ฝากเงินไม่อนุมัติ';
+      const message = txn.txnType === 'withdraw'
+        ? `คำขอถอน ${txn.amount}  ถูกปฏิเสธ${reason ? (': ' + reason) : ''}`
+        : `คำขอฝาก ${txn.amount}  ถูกปฏิเสธ${reason ? (': ' + reason) : ''}`;
+      try { await createNotification({ userId: txn.userId, type, title, message, meta: { transactionId: id, amount: txn.amount } }); } catch (e) { console.error('notify failed', e); }
+      const targetUsername = await resolveUsernameById(txn.userId);
+      await appendAuditLogEntry({
+        action: "transaction_rejected",
+        actorId: req.session?.userId ?? null,
+        actorUsername: req.session?.username ?? null,
+        targetUserId: txn.userId,
+        targetUsername: targetUsername ?? null,
+        amount: Number(txn.amount),
+        txnType: String(txn.txnType || txn.txn_type || "").toLowerCase(),
+        status: "rejected",
+        transactionId: id,
+        note: reason ?? txn.note ?? null
+      });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('reject txn failed:', err);
+      return res.status(500).json({ message: 'ไม่สามารถปฏิเสธธุรกรรมได้' });
+    }
+  }
+  // demo fallback
+  const idx = fallbackTransactions.findIndex((t) => String(t.id) === String(id));
+  if (idx === -1) return res.status(404).json({ message: 'ไม่พบธุรกรรม' });
+  const txn = fallbackTransactions[idx];
+  txn.status = 'rejected';
+  const demoUser = users.find((u) => u.username === txn.username);
+  if (demoUser) {
+    if (String(txn.txn_type || "").toLowerCase() === "withdraw") {
+      demoUser.creditLimit = Number(demoUser.creditLimit ?? 0) + Number(txn.amount);
+    }
+    const list = fallbackNotifications.get(demoUser.username) || [];
+    const type = txn.txn_type === 'withdraw' ? 'withdraw' : 'deposit';
+    const title = txn.txn_type === 'withdraw' ? 'ถอนเงินไม่อนุมัติ' : 'ฝากเงินไม่อนุมัติ';
+    const message = txn.txn_type === 'withdraw'
+      ? `คำขอถอน ${txn.amount}  ถูกปฏิเสธ${reason ? (': ' + reason) : ''}`
+      : `คำขอฝาก ${txn.amount}  ถูกปฏิเสธ${reason ? (': ' + reason) : ''}`;
+    list.unshift({ id: `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`, type, title, message, meta: { transactionId: txn.id, amount: txn.amount }, read: false, createdAt: new Date().toISOString() });
+    fallbackNotifications.set(demoUser.username, list);
+  }
+  await appendAuditLogEntry({
+    action: "transaction_rejected",
+    actorId: req.session?.userId ?? null,
+    actorUsername: req.session?.username ?? null,
+    targetUserId: demoUser?.id ?? null,
+    targetUsername: txn.username ?? demoUser?.username ?? null,
+    amount: Number(txn.amount),
+    txnType: String(txn.txn_type || txn.txnType || "").toLowerCase(),
+    status: "rejected",
+    transactionId: id,
+    note: reason ?? txn.note ?? null
+  });
+  return res.json({ ok: true });
+});
+
+app.put("/api/admin/payout-rates/:lotteryCode", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  if (!Array.isArray(req.body)) {
+    return res.status(400).json({ message: "รูปแบบข้อมูลไม่ถูกต้อง" });
+  }
+  try {
+    await replacePayoutRates(req.params.lotteryCode, req.body);
+    res.json({ message: "บันทึกเรตจ่ายสำเร็จ" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "ไม่สามารถบันทึกเรตจ่ายได้" });
+  }
+});
+
+app.get("/api/admin/purchase-logs", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  try {
+    const logs = await fetchPurchaseLogs(limit);
+    res.json(logs);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "ไม่สามารถดึงข้อมูล log ได้" });
+  }
+});
+
+app.get("/api/admin/round-number-summary", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const lotteryCode = String(req.query?.lotteryCode || "").trim();
+  const drawDate = String(req.query?.drawDate || "").trim();
+  const startDate = String(req.query?.startDate || "").trim();
+  const endDate = String(req.query?.endDate || "").trim();
+  const useRange = Boolean(startDate || endDate);
+  if (!lotteryCode) {
+    return res.status(400).json({ message: "ระบุ lotteryCode" });
+  }
+  if (useRange) {
+    if (!startDate || !endDate) {
+      return res.status(400).json({ message: "ระบุ startDate และ endDate (YYYY-MM-DD)" });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ message: "startDate ต้องไม่เกิน endDate" });
+    }
+  } else if (!drawDate) {
+    return res.status(400).json({ message: "ระบุ drawDate (YYYY-MM-DD)" });
+  }
+
+  const buildTotals = (items) => {
+    const totals = items.reduce(
+      (acc, item) => {
+        acc.totalAmount += Number(item.totalAmount ?? 0);
+        acc.totalLines += Number(item.ticketCount ?? 0);
+        return acc;
+      },
+      { totalAmount: 0, totalLines: 0, totalNumbers: items.length }
+    );
+    totals.totalNumbers = items.length;
+    return totals;
+  };
+
+  if (hasDatabase()) {
+    try {
+      const items = useRange
+        ? await fetchNumberSummaryForRange(lotteryCode, startDate, endDate)
+        : await fetchNumberSummaryForDraw(lotteryCode, drawDate);
+      const totals = buildTotals(items);
+      if (useRange) {
+        return res.json({ lotteryCode, startDate, endDate, totals, items });
+      }
+      return res.json({ lotteryCode, drawDate, totals, items });
+    } catch (err) {
+      console.error("round number summary failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงสรุปเลขของงวดได้" });
+    }
+  }
+
+  const effectiveStart = useRange ? startDate : drawDate;
+  const effectiveEnd = useRange ? endDate : drawDate;
+  const itemsMap = new Map();
+  const addItem = (item, username) => {
+    const number = String(item?.number ?? "").trim();
+    if (!number) return;
+    const betType = String(item?.betType || item?.bet_type || "standard");
+    const amount = Number(item?.amount ?? 0);
+    const key = `${betType}::${number}`;
+    const existing = itemsMap.get(key) || {
+      number,
+      betType,
+      totalAmount: 0,
+      ticketCount: 0,
+      userSet: new Set()
+    };
+    existing.totalAmount += amount;
+    existing.ticketCount += 1;
+    if (username) existing.userSet.add(username);
+    itemsMap.set(key, existing);
+  };
+
+  (purchaseHistory || []).forEach((ticket) => {
+    if (ticket.lotteryId !== lotteryCode) return;
+    const ticketDraw = ticket.drawDate || resolveDrawDateForLottery(ticket.lotteryId, ticket.createdAt);
+    if (!ticketDraw) return;
+    if (effectiveStart && ticketDraw < effectiveStart) return;
+    if (effectiveEnd && ticketDraw > effectiveEnd) return;
+    if (String(ticket.status || "").toLowerCase() === "cancelled") return;
+    const username = ticket.member || "";
+    if (Array.isArray(ticket.items) && ticket.items.length) {
+      ticket.items.forEach((item) => addItem(item, username));
+      return;
+    }
+    const numbers = normalizeNumberList(ticket.betNumbers);
+    const count = numbers.length || 1;
+    const amountPer = count ? Number(ticket.amount ?? 0) / count : 0;
+    numbers.forEach((num) => {
+      addItem({ number: num, amount: amountPer, betType: ticket.betType || "standard" }, username);
+    });
+  });
+
+  const items = Array.from(itemsMap.values())
+    .map((entry) => ({
+      number: entry.number,
+      betType: entry.betType,
+      totalAmount: Number(entry.totalAmount ?? 0),
+      ticketCount: Number(entry.ticketCount ?? 0),
+      userCount: entry.userSet.size
+    }))
+    .sort((a, b) => b.totalAmount - a.totalAmount || String(a.number).localeCompare(String(b.number)));
+
+  const totals = buildTotals(items);
+  if (useRange) {
+    return res.json({ lotteryCode, startDate, endDate, totals, items });
+  }
+  return res.json({ lotteryCode, drawDate, totals, items });
+});
+
+app.get("/api/admin/number-restrictions", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.json([]);
+  }
+  try {
+    const rows = await listNumberRestrictions();
+    res.json(rows);
+  } catch (err) {
+    console.error("restrictions failed:", err);
+    res.json([]);
+  }
+});
+
+app.post("/api/admin/number-restrictions", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const { lotteryCode, betType, number, payoutRate, note, maxAmount, discountPercent, scope } = req.body || {};
+  if (!lotteryCode || !betType || !number) {
+    return res.status(400).json({ message: "กรอกข้อมูลให้ครบถ้วน" });
+  }
+  try {
+    const created = await createNumberRestriction({
+      lotteryCode,
+      betType,
+      number,
+      payoutRate: typeof payoutRate === "number" ? payoutRate : null,
+      maxAmount: typeof maxAmount === "number" ? maxAmount : null,
+      discountPercent: typeof discountPercent === "number" ? discountPercent : null,
+      scope: scope || null,
+      note
+    });
+    res.status(201).json(created);
+  } catch (err) {
+    console.error("create restriction failed:", err);
+    res.status(500).json({ message: "ไม่สามารถบันทึกเลขอั้นได้" });
+  }
+});
+
+app.delete("/api/admin/number-restrictions/:id", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const id = Number(req.params.id);
+  if (!id) {
+    return res.status(400).json({ message: "ข้อมูลไม่ถูกต้อง" });
+  }
+  try {
+    await deleteNumberRestriction(id);
+    res.json({ message: "ลบเลขอั้นเรียบร้อย" });
+  } catch (err) {
+    console.error("delete restriction failed:", err);
+    res.status(500).json({ message: "ไม่สามารถลบเลขอั้นได้" });
+  }
+});
+
+app.get("/api/lottery-results/latest", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.json(defaultResults);
+  }
+  try {
+    let latest = await fetchLatestResults();
+    // if thai results missing, try to pull the newest draw automatically
+    if (!latest["th-lottery"]) {
+      try {
+        await syncThaiLottoFromApi({ pages: 1, max: 1 });
+        latest = await fetchLatestResults();
+      } catch (err) {
+        console.error("auto-sync thai lottery failed:", err.message || err);
+      }
+    }
+    if (!latest || !Object.keys(latest).length) {
+      return res.json(defaultResults);
+    }
+    res.json(latest);
+  } catch (err) {
+    console.error("latest results failed:", err);
+    res.status(500).json({ message: "ไม่สามารถดึงผลรางวัลได้" });
+  }
+});
+
+app.post("/api/admin/lottery-results", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  const payload = req.body || {};
+  if (!payload.lotteryCode || !payload.drawDate) {
+    return res.status(400).json({ message: "กรุณาระบุหวยและงวดที่ต้องการบันทึก" });
+  }
+  try {
+    const saved = await upsertLotteryResult(payload);
+    // attempt to auto-evaluate tickets for this draw (db mode)
+    if (hasDatabase()) {
+      try {
+        const evalResult = await evaluateTicketsForDraw(saved.lotteryCode, saved.drawDate);
+        console.log("Auto-evaluation completed:", evalResult);
+      } catch (err) {
+        console.error("auto-evaluate failed:", err.message || err);
+      }
+    }
+    res.status(201).json(saved);
+  } catch (err) {
+    console.error("save result failed:", err);
+    res.status(500).json({ message: "ไม่สามารถบันทึกผลรางวัลได้", error: err.message });
+  }
+});
+
+// Admin: fetch & save Thai lottery results from external API (rayriffy)
+app.post("/api/admin/sync/thai-lottery", async (req, res) => {
+  if (!hasDatabase()) {
+    return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  }
+  if (req.session?.role && req.session.role !== "admin") {
+    return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  }
+  const pages = Number(req.body?.pages || 2) || 2;
+  const max = Number(req.body?.max || 5) || 5;
+  try {
+    const result = await syncThaiLottoFromApi({ pages, max });
+    res.json(result);
+  } catch (err) {
+    console.error("sync thai lottery failed:", err);
+    res.status(500).json({ message: "ซิงก์ผลหวยไทยไม่สำเร็จ", error: err.message });
+  }
+});
+
+// Admin endpoint: evaluate pending tickets for a specific lottery draw
+app.post("/api/admin/lottery-results/:lotteryCode/:drawDate/evaluate", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  const { lotteryCode, drawDate } = req.params;
+  if (!lotteryCode || !drawDate) return res.status(400).json({ message: "ระบุ lotteryCode และ drawDate (YYYY-MM-DD)" });
+
+  if (hasDatabase()) {
+    try {
+      const result = await evaluateTicketsForDraw(lotteryCode, drawDate);
+      return res.json(result);
+    } catch (err) {
+      console.error("evaluate failed:", err.message || err);
+      return res.status(500).json({ message: "ไม่สามารถประมวลผลโพยได้", error: err.message });
+    }
+  }
+
+  
+
+  // Fallback/demo mode: evaluate in-memory purchaseHistory
+  try {
+    const target = purchaseHistory.filter((p) => {
+      if (p.lotteryId !== lotteryCode || p.status !== "pending") return false;
+      const candidate = p.drawDate || resolveDrawDateForLottery(p.lotteryId, p.createdAt);
+      return Boolean(candidate) && candidate === drawDate;
+    });
+    const seedRates = payoutSeeds[lotteryCode] || [];
+    let evaluated = 0, winners = 0, totalPayout = 0; const details = [];
+    for (const ticket of target) {
+      evaluated += 1;
+      const numbers = Array.isArray(ticket.betNumbers) ? ticket.betNumbers[0] : ticket.betNumbers;
+      const cleaned = (numbers || "").toString();
+      let matched = false;
+      // simple matching: 3-digit vs defaultResults / defaultResults object
+      const result = defaultResults?.[lotteryCode];
+      if (cleaned.length === 3 && result?.three_digits && cleaned === result.three_digits) matched = true;
+      if (cleaned.length === 2 && result?.two_digits && cleaned === result.two_digits) matched = true;
+      if (matched) {
+        const byType = seedRates.find((r) => r.betType === ticket.betType) || seedRates.find((r) => r.betType === (cleaned.length === 3 ? 'three-top' : 'two-top'));
+        const rate = byType ? Number(byType.rate) : null;
+        const payout = rate ? Number(ticket.amount) * rate : 0;
+        ticket.status = 'won';
+        ticket.payoutRate = rate;
+        // apply payout to demo user and add demo notification
+        const demoUser = users.find((u) => u.username === ticket.member);
+        if (demoUser) {
+          demoUser.creditLimit = Number(demoUser.creditLimit ?? 0) + payout;
+          const list = fallbackNotifications.get(demoUser.username) || [];
+          list.unshift({ id: `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`, type: 'winner', title: 'ถูกรางวัล', message: `โพยหมายเลข ${cleaned} ถูกรางวัล รับ ${payout} `, meta: { ticketId: ticket.id, payoutAmount: payout }, read: false, createdAt: new Date().toISOString() });
+          fallbackNotifications.set(demoUser.username, list);
+        }
+        winners += 1;
+        totalPayout += payout;
+        details.push({ ticketId: ticket.id, username: ticket.member, numbers: cleaned, amount: ticket.amount, payoutRate: rate, payoutAmount: payout });
+      } else {
+        ticket.status = 'lost';
+        details.push({ ticketId: ticket.id, username: ticket.member, numbers: cleaned, amount: ticket.amount, payoutRate: null, payoutAmount: 0 });
+      }
+    }
+    return res.json({ lotteryCode, drawDate, evaluated, winners, totalPayout, details });
+  } catch (err) {
+    console.error("fallback evaluate failed:", err);
+    return res.status(500).json({ message: "ไม่สามารถประมวลผลโพย (demo) ได้" });
+  }
+});
+
+// Admin: auto-evaluate pending tickets using the latest results
+app.post("/api/admin/evaluate/latest", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  if (!hasDatabase()) return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  const filterCode = req.body?.lotteryCode || req.query?.lotteryCode || null;
+  try {
+    const latest = await fetchLatestResults(filterCode ? [filterCode] : undefined);
+    const entries = Object.entries(latest || {}).filter(([, info]) => info?.drawDate);
+    if (!entries.length) {
+      return res.status(404).json({ message: "ไม่พบผลรางวัลล่าสุดสำหรับประมวลผล" });
+    }
+    const results = [];
+    const errors = [];
+    for (const [code, info] of entries) {
+      try {
+        const evaluated = await evaluateTicketsForDraw(code, info.drawDate);
+        results.push(evaluated);
+      } catch (err) {
+        errors.push({ lotteryCode: code, drawDate: info.drawDate, error: err.message || "error" });
+      }
+    }
+    return res.json({ success: true, results, errors });
+  } catch (err) {
+    console.error("auto-evaluate-latest failed:", err.message || err);
+    return res.status(500).json({ message: "ไม่สามารถตรวจสอบโพยอัตโนมัติได้", error: err.message });
+  }
+});
+
+// Admin: confirm a ticket as won and credit payout
+app.post("/api/admin/tickets/:id/confirm-win", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  if (!hasDatabase()) return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  const ticketId = Number(req.params.id);
+  if (!ticketId) return res.status(400).json({ message: "ticketId ไม่ถูกต้อง" });
+  try {
+    const itemsPayload = Array.isArray(req.body?.items) ? req.body.items : null;
+    const requestedIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map((n) => Number(n)).filter(Boolean) : [];
+    const ticket = await fetchTicketById(ticketId);
+    if (!ticket) return res.status(404).json({ message: "ไม่พบโพย" });
+
+    const desiredRate = req.body?.payoutRate != null ? Number(req.body.payoutRate) : null;
+    let fallbackRate = desiredRate != null && !Number.isNaN(desiredRate) ? desiredRate : ticket.payoutRate;
+    let selectedLogs = [];
+    if (hasDatabase()) {
+      try {
+        const logs = await fetchPurchaseLogsByTicket(ticket.id);
+        if (logs?.length) {
+          if (itemsPayload?.length) {
+            const ids = itemsPayload.map((it) => Number(it.id)).filter(Boolean);
+            selectedLogs = logs.filter((log) => ids.includes(Number(log.id)));
+          } else if (requestedIds.length) {
+            selectedLogs = logs.filter((log) => requestedIds.includes(Number(log.id)));
+          } else {
+            selectedLogs = logs;
+          }
+          // ถ้าโพยถูกตั้งค่าเป็นถูกรางวัลแล้ว ให้เลือกเฉพาะ log ที่ยังไม่ถูกตั้งค่า won เพื่อกันจ่ายซ้ำ
+          if (ticket.status === "won") {
+            selectedLogs = selectedLogs.filter((log) => log.status !== "won");
+          }
+        }
+      } catch (err) {
+        console.warn("fetch logs failed:", err.message || err);
+      }
+    }
+    const resolveRate = async () => {
+      if (fallbackRate != null) return fallbackRate;
+      try {
+        const rates = await fetchPayoutRates(ticket.lotteryCode);
+        const numbers = Array.isArray(ticket.numbers) ? ticket.numbers : [ticket.numbers];
+        const firstNumber = numbers.find(Boolean) || "";
+        const fallbackType = firstNumber && String(firstNumber).trim().length === 3 ? "three-top" : "two-top";
+        const matched = rates.find((r) => r.betType === ticket.betType) || rates.find((r) => r.betType === fallbackType);
+        if (matched) {
+          return Number(matched.rate);
+        }
+      } catch (err) {
+        console.warn("lookup payout rate failed for ticket", ticketId, err.message || err);
+      }
+      return null;
+    };
+    if (!selectedLogs.length && Array.isArray(ticket.items) && ticket.items.length) {
+      selectedLogs = ticket.items.map((it, idx) => ({
+        id: it.id ?? idx,
+        amount: Number(it.amount ?? ticket.amount ?? 0),
+        payoutRate: it.payoutRate ?? null
+      }));
+    }
+    if (!selectedLogs.length) {
+      const resolved = await resolveRate();
+      if (resolved == null) {
+        return res.status(400).json({ message: "ไม่พบเรตจ่ายสำหรับโพยนี้ กรุณาระบุ payoutRate" });
+      }
+      fallbackRate = resolved;
+      selectedLogs = [{ id: null, amount: Number(ticket.amount ?? 0), payoutRate: resolved }];
+    }
+    let payoutAmount = 0;
+    const logIdsToUpdate = [];
+    const ratesById = {};
+    for (const log of selectedLogs) {
+      const override = itemsPayload?.find((it) => Number(it.id) === Number(log.id))?.payoutRate;
+      const rate = override ?? log.payoutRate ?? fallbackRate;
+      if (rate == null) continue;
+      // จ่ายเฉพาะรายการที่ยังไม่ถูกจ่าย (paid = false หรือ status ยังไม่ win)
+      const alreadyPaid = log.paid === true || log.status === "won";
+      if (!alreadyPaid) {
+        payoutAmount += Number(log.amount ?? 0) * Number(rate);
+        if (log.id) {
+          logIdsToUpdate.push(log.id);
+          ratesById[log.id] = rate;
+        }
+      }
+      if (fallbackRate == null && rate != null) {
+        fallbackRate = rate;
+      }
+    }
+    if (!payoutAmount) {
+      return res.status(400).json({ message: "ไม่พบเรตจ่ายหรือจำนวนเงินของรายการที่เลือก" });
+    }
+
+    const effectiveRate = fallbackRate ?? Object.values(ratesById)[0] ?? ticket.payoutRate ?? desiredRate ?? null;
+    await markTicketResult(ticket.id, "won", effectiveRate);
+    try {
+      await applyPayoutToUser(ticket.userId, payoutAmount);
+    } catch (err) {
+      console.error("apply payout failed:", err.message || err);
+    }
+    if (logIdsToUpdate.length) {
+      try {
+        // update all with first rate; precision per id if provided
+        const primaryRate = ratesById[logIdsToUpdate[0]] ?? effectiveRate;
+        await markPurchaseLogsStatus(logIdsToUpdate, "won", primaryRate);
+      } catch (err) {
+        console.warn("mark logs won failed:", err.message || err);
+      }
+    }
+    try {
+      await createNotification({
+        userId: ticket.userId,
+        type: "winner",
+        title: "ถูกรางวัล (ตั้งค่าด้วยแอดมิน)",
+        message: `โพย #${ticket.id} จ่าย ${payoutAmount}`,
+        meta: { ticketId: ticket.id, payoutAmount, payoutRate: effectiveRate }
+      });
+    } catch (err) {
+      console.error("notify winner failed:", err.message || err);
+    }
+    let aggregateStatus = "won";
+    try {
+      const agg = await recalcTicketStatusFromItems(ticket.id);
+      if (agg?.status) aggregateStatus = agg.status;
+    } catch {}
+    return res.json({ ticketId: ticket.id, payoutRate: effectiveRate, payoutAmount, status: aggregateStatus });
+  } catch (err) {
+    console.error("confirm-win failed:", err.message || err);
+    return res.status(500).json({ message: "ไม่สามารถตั้งค่าโพยเป็นถูกรางวัลได้", error: err.message });
+  }
+});
+
+// Admin: mark ticket as not winning and notify
+app.post("/api/admin/tickets/:id/confirm-lose", async (req, res) => {
+  if (req.session?.role !== "admin") return res.status(403).json({ message: "ต้องเป็นผู้ดูแลระบบ" });
+  if (!hasDatabase()) return res.status(503).json({ message: "ระบบฐานข้อมูลยังไม่พร้อมใช้งาน" });
+  const ticketId = Number(req.params.id);
+  if (!ticketId) return res.status(400).json({ message: "ticketId ไม่ถูกต้อง" });
+  try {
+    const itemsPayload = Array.isArray(req.body?.items) ? req.body.items : null;
+    const requestedIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map((n) => Number(n)).filter(Boolean) : [];
+    const ticket = await fetchTicketById(ticketId);
+    if (!ticket) return res.status(404).json({ message: "ไม่พบโพย" });
+
+    let selectedLogs = [];
+    if (hasDatabase()) {
+      try {
+        const logs = await fetchPurchaseLogsByTicket(ticket.id);
+        if (logs?.length) {
+          if (itemsPayload?.length) {
+            const ids = itemsPayload.map((it) => Number(it.id)).filter(Boolean);
+            selectedLogs = logs.filter((log) => ids.includes(Number(log.id)));
+          } else if (requestedIds.length) {
+            selectedLogs = logs.filter((log) => requestedIds.includes(Number(log.id)));
+          } else {
+            selectedLogs = logs;
+          }
+        }
+      } catch (err) {
+        console.warn("fetch logs failed:", err.message || err);
+      }
+    }
+
+    // หากตั้งค่าเป็นไม่ถูกรางวัลไปแล้ว และไม่มีรายการให้ตั้งค่าเพิ่ม ให้ตอบกลับสำเร็จแบบ idempotent
+    if (!selectedLogs.length && ticket.status === "lost") {
+      return res.json({ ticketId: ticket.id, status: "lost" });
+    }
+
+    if (selectedLogs.length) {
+      try {
+        await markPurchaseLogsStatus(selectedLogs.map((l) => l.id), "lost", null);
+      } catch (err) {
+        console.warn("mark logs lost failed:", err.message || err);
+      }
+    }
+    let aggregateStatus = "lost";
+    try {
+      const agg = await recalcTicketStatusFromItems(ticket.id);
+      if (agg?.status) aggregateStatus = agg.status;
+      await markTicketResult(ticket.id, aggregateStatus, null);
+    } catch {
+      await markTicketResult(ticket.id, "lost", null);
+    }
+    try {
+      await createNotification({
+        userId: ticket.userId,
+        type: "loser",
+        title: "โพยไม่ถูกรางวัล",
+        message: `โพย #${ticket.id} ไม่ถูกรางวัล`,
+        meta: { ticketId: ticket.id }
+      });
+    } catch (err) {
+      console.error("notify loser failed:", err.message || err);
+    }
+    return res.json({ ticketId: ticket.id, status: aggregateStatus });
+  } catch (err) {
+    console.error("confirm-lose failed:", err.message || err);
+    return res.status(500).json({ message: "ไม่สามารถตั้งค่าโพยเป็นไม่ถูกรางวัลได้", error: err.message });
+  }
+});
+
+// Get notifications for current user
+app.get("/api/notifications", async (req, res) => {
+  if (req.session?.guest) return res.json([]);
+  const username = req.session?.username;
+  const userId = req.session?.userId;
+  if (hasDatabase()) {
+    try {
+      const notes = await fetchNotifications(userId);
+      return res.json(notes);
+    } catch (err) {
+      console.error("fetch notifications failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถดึงแจ้งเตือนได้" });
+    }
+  }
+  const list = fallbackNotifications.get(username) || [];
+  return res.json(list);
+});
+
+// Mark notification read
+app.post("/api/notifications/:id/read", async (req, res) => {
+  if (req.session?.guest) return res.status(403).json({ message: "ต้องเป็นผู้ใช้งานจริง" });
+  const id = req.params?.id;
+  const username = req.session?.username;
+  if (hasDatabase()) {
+    try {
+      await markNotificationRead(id);
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("mark notification read failed:", err);
+      return res.status(500).json({ message: "ไม่สามารถทำเครื่องหมายอ่านได้" });
+    }
+  }
+  // demo fallback: find in fallbackNotifications and mark
+  const list = fallbackNotifications.get(username) || [];
+  const idx = list.findIndex((n) => String(n.id) === String(id));
+  if (idx !== -1) {
+    list[idx].read = true;
+    fallbackNotifications.set(username, list);
+  }
+  return res.json({ ok: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`Demo API running on http://localhost:${PORT}`);
+});

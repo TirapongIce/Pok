@@ -1,0 +1,11 @@
+{
+  "name": "lottery-system-monorepo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node dev.js",
+    "dev:client": "npm run dev --prefix client",
+    "dev:server": "npm run dev --prefix server",
+    "bot:full": "node scripts/fullLoopBot.js"
+  }
+}

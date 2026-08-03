@@ -1,0 +1,142 @@
+<mxfile host="app.diagrams.net" modified="2025-01-01T12:00:00.000Z" agent="5.0 (Macintosh)" version="20.6.3" type="device">
+  <diagram id="main" name="Batch Flow New">
+    <mxGraphModel dx="1382" dy="778" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Start -->
+        <mxCell id="start" value="Start" style="ellipse;whiteSpace=wrap;html=1;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="240" y="20" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Start Logging -->
+        <mxCell id="startLog" value="Start Logging" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#dae8fc;" vertex="1" parent="1">
+          <mxGeometry x="220" y="110" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Connect DB -->
+        <mxCell id="connectDb" value="Connect DB" style="rhombus;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#fff2cc;" vertex="1" parent="1">
+          <mxGeometry x="240" y="200" width="120" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- DB Fail -->
+        <mxCell id="dbFail" value="Log Error: Connect DB Fail" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#f8cecc;" vertex="1" parent="1">
+          <mxGeometry x="430" y="200" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Phase 1 -->
+        <mxCell id="phase1" value="PHASE 1: EXTRACT DATA" style="swimlane;whiteSpace=wrap;html=1;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="310" width="550" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- Extract Surround -->
+        <mxCell id="ex1" value="Extract: Surround Transaction" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#d5e8d4;" vertex="1" parent="phase1">
+          <mxGeometry x="40" y="40" width="220" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Surround Fail -->
+        <mxCell id="ex1fail" value="Fail → Log Error → Stop" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#f8cecc;" vertex="1" parent="phase1">
+          <mxGeometry x="300" y="40" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Extract Master Surround -->
+        <mxCell id="ex2" value="Extract: Master Surround" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#d5e8d4;" vertex="1" parent="phase1">
+          <mxGeometry x="40" y="130" width="220" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Master Fail -->
+        <mxCell id="ex2fail" value="Fail → Log Error → Stop" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#f8cecc;" vertex="1" parent="phase1">
+          <mxGeometry x="300" y="130" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Extract Trans Copay -->
+        <mxCell id="ex3" value="Extract: Trans Copay" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#d5e8d4;" vertex="1" parent="phase1">
+          <mxGeometry x="40" y="220" width="220" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Trans Fail -->
+        <mxCell id="ex3fail" value="Fail → Log Error → Stop" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#f8cecc;" vertex="1" parent="phase1">
+          <mxGeometry x="300" y="220" width="200" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Phase 2 -->
+        <mxCell id="phase2" value="PHASE 2: VALIDATE & TRANSFORM" style="swimlane;whiteSpace=wrap;html=1;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="550" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Validate -->
+        <mxCell id="validate" value="Business Rule Validation" style="rhombus;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#fff2cc;" vertex="1" parent="phase2">
+          <mxGeometry x="180" y="60" width="180" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Validate Fail -->
+        <mxCell id="validateFail" value="Fail → Log Error → Stop" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#f8cecc;" vertex="1" parent="phase2">
+          <mxGeometry x="380" y="80" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Phase 3 -->
+        <mxCell id="phase3" value="PHASE 3: LOAD → INSERT RunCopay" style="swimlane;whiteSpace=wrap;html=1;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="830" width="550" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- Begin Transaction -->
+        <mxCell id="beginTx" value="BEGIN TRANSACTION" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#dae8fc;" vertex="1" parent="phase3">
+          <mxGeometry x="140" y="40" width="260" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Insert -->
+        <mxCell id="insertData" value="Insert Data into RunCopay" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#fff2cc;" vertex="1" parent="phase3">
+          <mxGeometry x="140" y="130" width="260" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Insert Fail (Rollback) -->
+        <mxCell id="rollback" value="Insert Fail → ROLLBACK → Log Error → Stop" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#f8cecc;" vertex="1" parent="phase3">
+          <mxGeometry x="420" y="130" width="250" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Commit -->
+        <mxCell id="commit" value="COMMIT" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#d5e8d4;" vertex="1" parent="phase3">
+          <mxGeometry x="180" y="210" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- End Logging -->
+        <mxCell id="stopLog" value="Stop Logging" style="rounded=1;whiteSpace=wrap;html=1;strokeWidth=2;fillColor=#dae8fc;" vertex="1" parent="1">
+          <mxGeometry x="220" y="1120" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Stop -->
+        <mxCell id="stop" value="Stop" style="ellipse;whiteSpace=wrap;html=1;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="240" y="1210" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Connections -->
+
+        <mxCell id="edge1" edge="1" parent="1" target="startLog" source="start" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;"/>
+        <mxCell id="edge2" edge="1" parent="1" target="connectDb" source="startLog" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;"/>
+        <mxCell id="edge3" edge="1" parent="1" target="dbFail" source="connectDb" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;"/>
+        
+        <!-- DB OK path -->
+        <mxCell id="edgeDbOK" edge="1" parent="1" target="phase1" source="connectDb" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;entryX=0.5;entryY=0;"/>
+
+        <!-- Phase1 connections -->
+        <mxCell id="p1_1" edge="1" parent="phase1" source="ex1" target="ex2" style="strokeWidth=2;edgeStyle=orthogonalEdgeStyle;"/>
+        <mxCell id="p1_2" edge="1" parent="phase1" source="ex2" target="ex3" style="strokeWidth=2;edgeStyle=orthogonalEdgeStyle;"/>
+
+        <mxCell id="edgeToPhase2" edge="1" parent="1" target="phase2" source="phase1" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;entryX=0.5;entryY=0;"/>
+
+        <!-- Phase2 connections -->
+        <mxCell id="edgeToP3" edge="1" parent="1" target="phase3" source="phase2" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;entryX=0.5;entryY=0;"/>
+
+        <!-- Phase3 connections -->
+        <mxCell id="p3_1" edge="1" parent="phase3" source="beginTx" target="insertData" style="strokeWidth=2;edgeStyle=orthogonalEdgeStyle;"/>
+        <mxCell id="p3_2" edge="1" parent="phase3" source="insertData" target="commit" style="strokeWidth=2;edgeStyle=orthogonalEdgeStyle;"/>
+
+        <mxCell id="edgeStopLog" edge="1" parent="1" target="stopLog" source="phase3" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;entryX=0.5;entryY=1;"/>
+        <mxCell id="edgeStop" edge="1" parent="1" target="stop" source="stopLog" style="edgeStyle=orthogonalEdgeStyle;strokeWidth=2;"/>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

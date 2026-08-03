@@ -1,0 +1,30 @@
+export const thaiLotterySchedule = {
+  startMonth: "2025-11",
+  endMonth: "2026-11",
+  schedule: [
+    { round: 1,  date: "2025-12-01", close: "14:30" },
+    { round: 2,  date: "2025-12-16", close: "14:30" },
+    { round: 3,  date: "2026-01-01", close: "14:30" },
+    { round: 4,  date: "2026-01-16", close: "14:30" },
+    { round: 5,  date: "2026-02-01", close: "14:30" },
+    { round: 6,  date: "2026-02-16", close: "14:30" },
+    { round: 7,  date: "2026-03-01", close: "14:30" },
+    { round: 8,  date: "2026-03-16", close: "14:30" },
+    { round: 9,  date: "2026-04-01", close: "14:30" },
+    { round: 10, date: "2026-04-16", close: "14:30" },
+    { round: 11, date: "2026-05-01", close: "14:30" },
+    { round: 12, date: "2026-05-16", close: "14:30" },
+    { round: 13, date: "2026-06-01", close: "14:30" },
+    { round: 14, date: "2026-06-16", close: "14:30" },
+    { round: 15, date: "2026-07-01", close: "14:30" },
+    { round: 16, date: "2026-07-16", close: "14:30" },
+    { round: 17, date: "2026-08-01", close: "14:30" },
+    { round: 18, date: "2026-08-16", close: "14:30" },
+    { round: 19, date: "2026-09-01", close: "14:30" },
+    { round: 20, date: "2026-09-16", close: "14:30" },
+    { round: 21, date: "2026-10-01", close: "14:30" },
+    { round: 22, date: "2026-10-16", close: "14:30" },
+    { round: 23, date: "2026-11-01", close: "14:30" },
+    { round: 24, date: "2026-11-16", close: "14:30" }
+  ]
+};
