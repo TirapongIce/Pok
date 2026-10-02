@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: pok-team-test
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerCommand: /bin/sh -c "node scripts/initDatabase.js && exec node src/index.js"
+    healthCheckPath: /api/health/db
+    envVars:
+      - key: SUPERADMIN_USERNAME
+        value: superadmin
+      - key: SUPERADMIN_PASSWORD
+        generateValue: true
+      - key: DB_HOST
+        fromDatabase:
+          name: pok-team-test-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: pok-team-test-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: pok-team-test-db
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: pok-team-test-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: pok-team-test-db
+          property: password
+      - key: DB_SSL
+        value: "false"
+      - key: SEED_DEMO_DATA
+        value: "false"
+      - key: THAI_SYNC_AUTO
+        value: "false"
+databases:
+  - name: pok-team-test-db
+    plan: free
+    region: singapore
+    databaseName: pok_team_test
+    user: pok_team_test
+    ipAllowList: []
