@@ -1740,7 +1740,6 @@ export default function App() {
           </div>
           <div className="login-form">
             <h2>{t("login.title", "เข้าสู่ระบบตัวแทน")}</h2>
-            <p className="badge badge-warning">ระบบทดสอบภายในทีม — ใช้เครดิตจำลองเท่านั้น</p>
             {loginError && <p className="badge badge-warning">{loginError}</p>}
             <form onSubmit={handleLogin}>
               <div className="field">
@@ -1782,7 +1781,6 @@ export default function App() {
         <div className={`sidebar-backdrop ${sidebarOpen ? "active" : ""}`} onClick={() => setSidebarOpen(false)} />
         <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>{navList}</aside>
         <main className="content">
-          <p className="badge badge-warning">ระบบทดสอบภายในทีม — ใช้เครดิตจำลองเท่านั้น</p>
           {loading && <p className="text-muted">กำลังโหลดข้อมูล...</p>}
           {error && <p className="text-error">{error}</p>}
           {renderMainContent()}
