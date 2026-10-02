@@ -77,3 +77,18 @@ npm run fix:draw-dates
 ## GitHub และการเผยแพร่เว็บ
 
 Push เข้า GitHub จะรัน CI และสร้าง artifact `team-test-client` เท่านั้น ไม่ได้เผยแพร่ API/DB หรือเว็บไซต์ให้ทีมใช้งานอัตโนมัติ หากนำไปรันบน server ของทีม ให้ deploy API + PostgreSQL และ serve client/dist โดย proxy `/api` ไป API ผ่าน HTTPS
+
+
+### Deploy ด้วย Docker บน hosting ของทีม
+
+`Dockerfile` ที่ root build หน้าเว็บและให้ Node serve ทั้ง UI และ `/api` ที่ origin เดียวกัน รันด้วยผู้ใช้ที่ไม่ใช่ root และไม่คัดลอก `.env` เข้า image
+
+1. สร้าง PostgreSQL สำหรับทดสอบแยกต่างหาก ตั้ง `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` ผ่าน secrets ของ hosting
+2. ตั้ง `SUPERADMIN_PASSWORD` เป็นรหัสเฉพาะของทีม ไม่ commit รหัสผ่าน; `SEED_DEMO_DATA=false` และ `THAI_SYNC_AUTO=false` เป็นค่าปกติใน Docker
+3. Build จาก Dockerfile ที่ root ตั้ง pre-deploy command เป็น `node scripts/initDatabase.js` (working directory ใน image คือ `/app/server`) เพื่อสร้าง schema ก่อน start
+4. Hosting ต้องส่ง traffic ไปที่ `PORT` (ปกติ 4001) เปิด HTTPS และตรวจสุขภาพที่ `/api/health/db`
+5. หลัง deploy ให้ใช้บัญชีแอดมินสร้างบัญชีแยกให้ผู้ทดสอบแต่ละคน อย่าใส่รหัสแอดมินลง URL ที่แชร์
+
+หากใช้ฐานข้อมูลที่บังคับ TLS ให้ตั้ง `DB_SSL=true` และ CA ตามผู้ให้บริการ โหมดนี้ตรวจ certificate จริงไม่ปิด verification
+
+การ build image หรือ push GitHub ยังไม่สร้าง URL สาธารณะ ต้องเชื่อมบัญชี hosting และ deploy ให้สำเร็จก่อน

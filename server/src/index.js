@@ -1,3 +1,4 @@
+import { mountClient } from "./services/serveClient.js";
 import { requestTestWithdrawal, decideTestTransaction, validAmount } from "./services/testWallet.js";
 import { SettingsStore } from "./services/settingsStore.js";
 import express from "express";
@@ -474,6 +475,7 @@ const PORT = process.env.PORT || 4001;
 app.use(cors());
 app.use(express.json());
 app.use(morgan("dev"));
+mountClient(app);
 
 // Multer for handling multipart form-data (e.g. deposit slip uploads). Memory storage for now.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 10 } });

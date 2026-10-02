@@ -8,7 +8,8 @@
     "start": "NODE_ENV=production node src/index.js",
     "fix:draw-dates": "node scripts/fixDrawDates.js",
     "report:reconcile": "node scripts/reconcilePayouts.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "db:init": "node scripts/initDatabase.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
