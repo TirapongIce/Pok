@@ -15,6 +15,7 @@ export default function AccountSettingsPanel({
     registrationNo: profile?.account?.registration_no ?? "",
   });
   const [passwordForm, setPasswordForm] = useState({
+    currentPassword: "",
     password: "",
     confirm: "",
   });
@@ -40,13 +41,13 @@ export default function AccountSettingsPanel({
       alert("รหัสผ่านไม่ตรงกัน");
       return;
     }
-    if (passwordForm.password.length < 6) {
-      alert("รหัสผ่านต้องมีความยาวอย่างน้อย 6 ตัวอักษร");
+    if (passwordForm.password.length < 8) {
+      alert("รหัสผ่านต้องมีความยาวอย่างน้อย 8 ตัวอักษร");
       return;
     }
     try {
-      await onChangePassword?.(passwordForm.password);
-      setPasswordForm({ password: "", confirm: "" });
+      await onChangePassword?.(passwordForm.password, passwordForm.currentPassword);
+      setPasswordForm({ currentPassword: "", password: "", confirm: "" });
       alert("เปลี่ยนรหัสผ่านเรียบร้อย");
     } catch (err) {
       console.error(err);
@@ -123,6 +124,10 @@ export default function AccountSettingsPanel({
 
         {/* password section ใช้ grid 2 col เหมือนกัน */}
         <div className="form-grid form-password">
+          <div className="field">
+            <label htmlFor="current-password">รหัสผ่านปัจจุบัน</label>
+            <input id="current-password" type="password" name="currentPassword" autoComplete="current-password" required value={passwordForm.currentPassword} onChange={handlePasswordChange} />
+          </div>
           <div className="field">
             <label>รหัสผ่านใหม่</label>
             <input

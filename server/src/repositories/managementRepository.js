@@ -13,17 +13,37 @@ let supportsPurchaseLogPaidColumn = true;
 let supportsPurchaseLogDrawDateColumn = true;
 let supportsAuditLogTable = true;
 
-async function ensurePurchaseLogOptionalColumns() {
+const SCHEMA_UPGRADES = [
+  "ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS payout_rate NUMERIC(12,2)",
+  "ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS status VARCHAR(20)",
+  "ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE",
+  "ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS payout_amount NUMERIC(14,2)",
+  "ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS settled_at TIMESTAMP",
+  "ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS draw_date DATE",
+  "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS draw_date DATE",
+  "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS promotion_code VARCHAR(50)",
+  "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS payout_amount NUMERIC(14,2) DEFAULT 0",
+  "ALTER TABLE lotteries ADD COLUMN IF NOT EXISTS group_name VARCHAR(100)",
+  "ALTER TYPE lottery_kind ADD VALUE IF NOT EXISTS 'viet'",
+  "ALTER TYPE lottery_kind ADD VALUE IF NOT EXISTS 'international'",
+  "CREATE INDEX IF NOT EXISTS idx_purchase_logs_draw_number ON purchase_logs(lottery_code, draw_date, bet_type, numbers)"
+];
+
+// migration แบบ idempotent รันตอนเริ่ม server (ทุกคำสั่งใช้ IF NOT EXISTS)
+export async function ensureSchemaUpgrades() {
   if (ensuredPurchaseLogColumns || !pool) return;
   ensuredPurchaseLogColumns = true;
-  try {
-    await pool.query("ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS payout_rate NUMERIC(12,2)");
-    await pool.query("ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS status VARCHAR(20)");
-    await pool.query("ALTER TABLE purchase_logs ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE");
-  } catch (err) {
-    if (isMissingRelation(err)) return;
-    // ignore other dbs
+  for (const sql of SCHEMA_UPGRADES) {
+    try {
+      await pool.query(sql);
+    } catch (err) {
+      if (!isMissingRelation(err)) console.warn(`[db] schema upgrade skipped (${sql}):`, err.message);
+    }
   }
+}
+
+async function ensurePurchaseLogOptionalColumns() {
+  await ensureSchemaUpgrades();
 }
 
 function isMissingRelation(err) {
@@ -157,18 +177,18 @@ export async function upsertLottery({ code, name, kind = "international", openTi
   return rows?.[0];
 }
 
-export async function ensureSuperAdmin({ username, passwordHash, creditLimit = 500000 }) {
+export async function ensureSuperAdmin({ username, passwordHash, creditLimit = 500000, resetPassword = false }) {
   if (!pool || !username || !passwordHash) return null;
   const { rows } = await pool.query("SELECT id, credit_limit FROM users WHERE username = $1 LIMIT 1", [username]);
   if (rows.length) {
     const existing = rows[0];
-    const resolvedCredit = Math.max(Number(existing.credit_limit ?? 0), creditLimit ?? 0);
-    await pool.query("UPDATE users SET role = 'admin', password_hash = $1, credit_limit = $2 WHERE id = $3", [
-      passwordHash,
-      resolvedCredit,
-      existing.id
-    ]);
-    return { id: existing.id, username, created: false, creditLimit: resolvedCredit };
+    // ไม่รีเซ็ตรหัสผ่าน/เครดิตทุกครั้งที่ restart; รีเซ็ตรหัสผ่านเฉพาะเมื่อตั้ง SUPERADMIN_PASSWORD ไว้ชัดเจน
+    if (resetPassword) {
+      await pool.query("UPDATE users SET role = 'admin', password_hash = $1 WHERE id = $2", [passwordHash, existing.id]);
+    } else {
+      await pool.query("UPDATE users SET role = 'admin' WHERE id = $1", [existing.id]);
+    }
+    return { id: existing.id, username, created: false, creditLimit: Number(existing.credit_limit ?? 0) };
   }
   const { rows: created } = await pool.query(
     "INSERT INTO users (username, password_hash, role, credit_limit, credit_used) VALUES ($1, $2, 'admin', $3, 0) RETURNING id",
@@ -533,9 +553,9 @@ function mapNumberRestrictionRow(row) {
     lotteryCode: row.lottery_code,
     betType: row.bet_type,
     number: row.number,
-    payoutRate: row.payout_rate ? Number(row.payout_rate) : null,
-    maxAmount: row.max_amount ? Number(row.max_amount) : null,
-    discountPercent: row.discount_percent ? Number(row.discount_percent) : null,
+    payoutRate: row.payout_rate != null ? Number(row.payout_rate) : null,
+    maxAmount: row.max_amount != null ? Number(row.max_amount) : null,
+    discountPercent: row.discount_percent != null ? Number(row.discount_percent) : null,
     scope: row.scope ?? null,
     note: row.note ?? "",
     createdAt: row.created_at
@@ -613,20 +633,13 @@ function mapLotteryResultRow(row) {
     row.draw_date instanceof Date
       ? `${row.draw_date.getFullYear()}-${String(row.draw_date.getMonth() + 1).padStart(2, "0")}-${String(row.draw_date.getDate()).padStart(2, "0")}`
       : row.draw_date;
-  const firstPrizeStr = row.first_prize ? String(row.first_prize) : "";
-  const fallbackFront = firstPrizeStr.length >= 3 ? [firstPrizeStr.slice(0, 3)] : [];
-  const fallbackBack = firstPrizeStr.length >= 3 ? [firstPrizeStr.slice(-3)] : [];
-  const isThai = (row.lottery_code || "").toLowerCase().includes("th-lottery") || (row.lottery_code || "").toLowerCase().includes("thai");
-  const resolvedFrontThree = isThai
-    ? fallbackFront
-    : [row.front_three_a, row.front_three_b].filter(Boolean).concat(fallbackFront).slice(0, 2);
   return {
     lotteryCode: row.lottery_code,
     drawDate,
     title: row.lottery_code === "th-lottery" ? "ผลหวยรัฐบาลไทย" : row.lottery_code === "lao-lottery" ? "ผลหวยลาวพัฒนา" : row.lottery_code,
     firstPrize: row.first_prize ?? undefined,
-    frontThree: resolvedFrontThree,
-    backThree: [row.back_three_a, row.back_three_b].filter(Boolean).concat(fallbackBack).slice(0, 2),
+    frontThree: [row.front_three_a, row.front_three_b].filter(Boolean),
+    backThree: [row.back_three_a, row.back_three_b].filter(Boolean),
     nearFirst: [row.near_first_a, row.near_first_b].filter(Boolean),
     twoDigits: row.two_digits ?? undefined,
     threeDigits: row.three_digits ?? undefined,
@@ -772,13 +785,7 @@ export async function seedInitialData({ lotteriesSeed = [], usersSeed = [], payo
     await pool.query(
       `INSERT INTO lotteries (code, name, kind, open_time, close_time, status, description)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (code) DO UPDATE SET
-         name = EXCLUDED.name,
-         kind = EXCLUDED.kind,
-         open_time = EXCLUDED.open_time,
-         close_time = EXCLUDED.close_time,
-         status = EXCLUDED.status,
-         description = EXCLUDED.description`,
+       ON CONFLICT (code) DO NOTHING`,
       [
         lottery.code,
         lottery.name,
@@ -796,10 +803,7 @@ export async function seedInitialData({ lotteriesSeed = [], usersSeed = [], payo
     await pool.query(
       `INSERT INTO users (username, password_hash, role, credit_limit, credit_used)
        VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (username) DO UPDATE SET
-         role = EXCLUDED.role,
-         credit_limit = EXCLUDED.credit_limit,
-         credit_used = EXCLUDED.credit_used`,
+       ON CONFLICT (username) DO NOTHING`,
       [seed.username, seed.passwordHash, seed.role ?? "agent", seed.creditLimit ?? 0, seed.creditUsed ?? 0]
     );
   }
@@ -811,8 +815,10 @@ export async function seedInitialData({ lotteriesSeed = [], usersSeed = [], payo
     await replacePayoutRates(lotteryCode, rates);
   }
 
+  // ผลจำลองใส่เฉพาะงวดที่ยังไม่มีผล (ไม่เขียนทับผลจริง)
   for (const [lotteryCode, result] of Object.entries(resultsSeed)) {
     if (!lotteryCode || !result?.drawDate) continue;
+    if (await fetchResultForDraw(lotteryCode, result.drawDate)) continue;
     await upsertLotteryResult({
       lotteryCode,
       drawDate: result.drawDate,
@@ -849,7 +855,7 @@ export async function sumTicketAmount({ todayOnly = false, userId } = {}) {
   return Number(rows?.[0]?.total ?? 0);
 }
 
-export async function fetchLedger(limit = 50) {
+export async function fetchLedger(limit = 50, { userId } = {}) {
   if (!pool) throw new Error("Database not configured");
   await ensurePurchaseLogOptionalColumns();
   const buildQuery = ({ includePromotion, includeDrawDate }) => {
@@ -863,14 +869,15 @@ export async function fetchLedger(limit = 50) {
             t.numbers,
             ${promoSelect}
             t.amount AS debit,
-            COALESCE(SUM(CASE WHEN pl.status = 'won' THEN pl.amount * COALESCE(pl.payout_rate, t.payout_rate) END), 0) AS credit,
+            COALESCE(SUM(CASE WHEN pl.status = 'won' THEN COALESCE(pl.payout_amount, pl.amount * COALESCE(pl.payout_rate, t.payout_rate)) END), 0) AS credit,
             t.status,
             t.created_at AS "createdAt",
             ${drawSelect}
-            COALESCE(json_agg(json_build_object('id', pl.id, 'number', pl.numbers, 'amount', pl.amount, 'betType', pl.bet_type, 'payoutRate', pl.payout_rate, 'status', pl.status)) FILTER (WHERE pl.id IS NOT NULL), '[]') AS items
+            COALESCE(json_agg(json_build_object('id', pl.id, 'number', pl.numbers, 'amount', pl.amount, 'betType', pl.bet_type, 'payoutRate', pl.payout_rate, 'payoutAmount', pl.payout_amount, 'status', pl.status) ORDER BY pl.id) FILTER (WHERE pl.id IS NOT NULL), '[]') AS items
        FROM tickets t
        LEFT JOIN users u ON t.user_id = u.id
        LEFT JOIN purchase_logs pl ON pl.ticket_id = t.id
+      ${userId ? "WHERE t.user_id = $2" : ""}
       GROUP BY t.id, u.username, t.lottery_code, t.numbers${promoGroup}, t.amount, t.payout_rate, t.created_at, t.status${drawGroup}
       ORDER BY t.created_at DESC
       LIMIT $1`;
@@ -880,13 +887,14 @@ export async function fetchLedger(limit = 50) {
   let includeDrawDate = supportsTicketDrawDateColumn;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const { rows } = await pool.query(buildQuery({ includePromotion, includeDrawDate }), [limit]);
+      const params = userId ? [limit, userId] : [limit];
+      const { rows } = await pool.query(buildQuery({ includePromotion, includeDrawDate }), params);
       return rows.map((row) => {
         const items = (row.items || []).map((it) => ({
           ...it,
           credit:
             it.status === "won"
-              ? Number(it.amount ?? 0) * Number(it.payoutRate ?? row.payout_rate ?? 0)
+              ? Number(it.payoutAmount ?? Number(it.amount ?? 0) * Number(it.payoutRate ?? row.payout_rate ?? 0))
               : 0
         }));
         const hasWinItem = items.some((it) => it.status === "won");
@@ -899,7 +907,7 @@ export async function fetchLedger(limit = 50) {
           promotionCode: includePromotion ? row.promotion_code ?? null : null,
           debit: Number(row.debit ?? 0),
           credit: creditTotal,
-          status: hasWinItem || creditTotal > 0 ? "won" : row.status === "lost" ? "lost" : row.status ?? "pending",
+          status: row.status === "cancelled" ? "cancelled" : hasWinItem || creditTotal > 0 ? "won" : row.status ?? "pending",
           createdAt: row.createdAt,
           items,
           drawDate: row.drawDate ?? (row.createdAt instanceof Date ? row.createdAt.toISOString().slice(0, 10) : (row.createdAt ? String(row.createdAt).slice(0, 10) : null))
@@ -1397,11 +1405,11 @@ export async function fetchNotifications(userId, limit = 50) {
   }
 }
 
-export async function markNotificationRead(notificationId) {
+export async function markNotificationRead(notificationId, userId) {
   if (!pool) return null;
   if (!notificationId) throw new Error("notificationId required");
   try {
-    const { rows } = await pool.query("UPDATE notifications SET read = TRUE WHERE id = $1 RETURNING id, read", [notificationId]);
+    const { rows } = await pool.query("UPDATE notifications SET read = TRUE WHERE id = $1 AND user_id = $2 RETURNING id, read", [notificationId, userId]);
     return rows?.[0] ?? null;
   } catch (err) {
     if (isMissingRelation(err)) return null;
@@ -1427,4 +1435,263 @@ export async function listChatThreads() {
     }
     throw err;
   }
+}
+
+// --- Transactional ticket lifecycle (ซื้อ / ยกเลิก / ตัดสินผล) ---
+
+function businessError(code, message, details) {
+  const err = new Error(message);
+  err.code = code;
+  if (details) err.details = details;
+  return err;
+}
+
+const roundMoney = (value) => Math.round(Number(value) * 100) / 100;
+
+async function withTransaction(work) {
+  if (!pool) throw new Error("Database not configured");
+  await ensureSchemaUpgrades();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ตัดเครดิต + บันทึกโพย + รายการ ในธุรกรรมเดียว
+// limits: [{ betType, number, maxAmount, adding, scope }] ตรวจยอดรวมของเลขในงวดไม่ให้เกิน maxAmount
+export async function createTicketWithItems({ userId, lotteryCode, drawDate, amount, promotionCode, items, limits = [] }) {
+  return withTransaction(async (client) => {
+    const drawLimits = limits.filter((limit) => limit.scope !== "ticket");
+    if (drawLimits.length) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${lotteryCode}:${drawDate}`]);
+    }
+    const { rows: users } = await client.query(
+      "SELECT id, credit_limit, credit_used FROM users WHERE id = $1 FOR UPDATE",
+      [userId]
+    );
+    if (!users.length) throw businessError("USER_NOT_FOUND", "ไม่พบข้อมูลผู้ใช้");
+    const available = Number(users[0].credit_limit ?? 0) - Number(users[0].credit_used ?? 0);
+    if (amount > available + 1e-6) {
+      throw businessError("INSUFFICIENT_CREDIT", "เครดิตไม่เพียงพอ", { required: amount, available });
+    }
+    for (const limit of drawLimits) {
+      const { rows } = await client.query(
+        `SELECT COALESCE(SUM(pl.amount), 0) AS total
+           FROM purchase_logs pl
+           JOIN tickets t ON t.id = pl.ticket_id
+          WHERE pl.lottery_code = $1 AND pl.draw_date = $2 AND pl.bet_type = $3 AND pl.numbers = $4
+            AND t.status <> 'cancelled'`,
+        [lotteryCode, drawDate, limit.betType, limit.number]
+      );
+      const total = Number(rows[0]?.total ?? 0);
+      if (total + limit.adding > limit.maxAmount + 1e-6) {
+        throw businessError("LIMIT_EXCEEDED", `เลข ${limit.number} รับได้อีก ${Math.max(0, limit.maxAmount - total).toLocaleString()} บาท`, {
+          number: limit.number,
+          betType: limit.betType,
+          remaining: Math.max(0, limit.maxAmount - total)
+        });
+      }
+    }
+    const { rows: updated } = await client.query(
+      "UPDATE users SET credit_limit = credit_limit - $2 WHERE id = $1 RETURNING credit_limit, credit_used",
+      [userId, amount]
+    );
+    const { rows: tickets } = await client.query(
+      `INSERT INTO tickets (user_id, lottery_code, bet_type, numbers, amount, payout_rate, status, draw_date, promotion_code)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+       RETURNING id, created_at`,
+      [userId, lotteryCode, items[0].betType, JSON.stringify(items.map((it) => it.number)), amount, items[0].payoutRate ?? null, drawDate, promotionCode ?? null]
+    );
+    const ticketId = tickets[0].id;
+    const values = [];
+    const placeholders = items.map((it, idx) => {
+      const base = idx * 8;
+      values.push(ticketId, userId, lotteryCode, it.betType, it.number, it.amount, it.payoutRate ?? null, drawDate);
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, 'pending', FALSE, $${base + 8})`;
+    });
+    const { rows: logs } = await client.query(
+      `INSERT INTO purchase_logs (ticket_id, user_id, lottery_code, bet_type, numbers, amount, payout_rate, status, paid, draw_date)
+       VALUES ${placeholders.join(", ")}
+       RETURNING id`,
+      values
+    );
+    const creditLimit = Number(updated[0].credit_limit ?? 0);
+    const creditUsed = Number(updated[0].credit_used ?? 0);
+    return {
+      ticketId: String(ticketId),
+      createdAt: tickets[0].created_at,
+      itemIds: logs.map((row) => String(row.id)),
+      creditLimit,
+      creditUsed,
+      creditAvailable: creditLimit - creditUsed
+    };
+  });
+}
+
+// ยกเลิกโพยที่ยังรอผล + คืนเครดิต (กันคืนซ้ำด้วย row lock)
+export async function cancelPendingTicket(ticketId) {
+  return withTransaction(async (client) => {
+    const { rows } = await client.query("SELECT id, user_id, amount, status FROM tickets WHERE id = $1 FOR UPDATE", [ticketId]);
+    if (!rows.length) throw businessError("NOT_FOUND", "ไม่พบโพย");
+    if (rows[0].status !== "pending") throw businessError("NOT_PENDING", "โพยนี้ไม่สามารถยกเลิกได้");
+    const { rows: paid } = await client.query(
+      "SELECT 1 FROM purchase_logs WHERE ticket_id = $1 AND (paid = TRUE OR status = 'won') LIMIT 1",
+      [ticketId]
+    );
+    if (paid.length) throw businessError("NOT_PENDING", "โพยนี้มีรายการที่จ่ายรางวัลแล้ว");
+    const refund = Number(rows[0].amount ?? 0);
+    await client.query("UPDATE tickets SET status = 'cancelled' WHERE id = $1", [ticketId]);
+    await client.query("UPDATE purchase_logs SET status = 'cancelled' WHERE ticket_id = $1", [ticketId]);
+    await client.query("UPDATE users SET credit_limit = credit_limit + $2 WHERE id = $1", [rows[0].user_id, refund]);
+    return { ticketId: String(ticketId), userId: rows[0].user_id, refund };
+  });
+}
+
+function mapSettleItem(row) {
+  return {
+    id: String(row.id),
+    betType: row.bet_type,
+    number: String(row.numbers ?? "").trim(),
+    amount: Number(row.amount ?? 0),
+    payoutRate: row.payout_rate != null ? Number(row.payout_rate) : null,
+    payoutAmount: row.payout_amount != null ? Number(row.payout_amount) : null,
+    status: row.status ?? "pending",
+    paid: row.paid === true
+  };
+}
+
+// ตัดสินผลรายรายการของโพย 1 ใบในธุรกรรมเดียว: อัปเดตรายการ, สถานะโพย และเติมเครดิตผู้ชนะ
+// decide(item) -> null (ไม่แตะ) | { status: "won", rate } | { status: "lost" } | { status: "pending", reason }
+// รายการที่จ่ายแล้ว (paid) จะไม่ถูกจ่ายซ้ำหรือย้อนสถานะ
+export async function settleTicketItems(ticketId, { decide, allowSettled = false }) {
+  return withTransaction(async (client) => {
+    const { rows: ticketRows } = await client.query(
+      `SELECT t.id, t.user_id, u.username, t.lottery_code, t.bet_type, t.numbers, t.amount, t.payout_rate, t.status, t.draw_date
+         FROM tickets t
+         LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.id = $1
+        FOR UPDATE OF t`,
+      [ticketId]
+    );
+    const ticket = ticketRows[0];
+    if (!ticket || ticket.status === "cancelled") return null;
+    if (!allowSettled && ticket.status !== "pending") return null;
+
+    const loadItems = () =>
+      client.query(
+        "SELECT id, bet_type, numbers, amount, payout_rate, payout_amount, status, paid FROM purchase_logs WHERE ticket_id = $1 ORDER BY id FOR UPDATE",
+        [ticketId]
+      );
+    let { rows: logRows } = await loadItems();
+    if (!logRows.length) {
+      // โพยรุ่นเก่าที่ไม่มีรายการย่อย: แตกเป็นรายการตามเลข แบ่งยอดเท่าๆ กัน
+      const numbers = normalizeNumberList(ticket.numbers);
+      const perItem = numbers.length ? Number(ticket.amount ?? 0) / numbers.length : 0;
+      for (const number of numbers) {
+        await client.query(
+          `INSERT INTO purchase_logs (ticket_id, user_id, lottery_code, bet_type, numbers, amount, payout_rate, status, paid, draw_date)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', FALSE, $8)`,
+          [ticketId, ticket.user_id, ticket.lottery_code, ticket.bet_type, String(number), perItem, ticket.payout_rate, ticket.draw_date]
+        );
+      }
+      ({ rows: logRows } = await loadItems());
+    }
+
+    const items = logRows.map(mapSettleItem);
+    let payout = 0;
+    for (const item of items) {
+      const decision = decide(item, ticket);
+      if (!decision) continue;
+      if (decision.status === "won") {
+        if (item.paid) continue;
+        const amount = roundMoney(item.amount * Number(decision.rate));
+        await client.query(
+          "UPDATE purchase_logs SET status = 'won', payout_rate = $2, payout_amount = $3, paid = TRUE, settled_at = NOW() WHERE id = $1",
+          [item.id, decision.rate, amount]
+        );
+        Object.assign(item, { status: "won", payoutRate: Number(decision.rate), payoutAmount: amount, paid: true });
+        payout += amount;
+      } else if (decision.status === "lost") {
+        if (item.paid) continue;
+        await client.query("UPDATE purchase_logs SET status = 'lost', payout_amount = 0, settled_at = NOW() WHERE id = $1", [item.id]);
+        Object.assign(item, { status: "lost", payoutAmount: 0 });
+      } else if (decision.reason) {
+        item.reason = decision.reason;
+      }
+    }
+
+    const hasPending = items.some((it) => !it.status || it.status === "pending");
+    const hasWon = items.some((it) => it.status === "won");
+    const status = hasPending ? "pending" : hasWon ? "won" : "lost";
+    const totalPaid = roundMoney(items.reduce((sum, it) => sum + (it.status === "won" ? Number(it.payoutAmount ?? 0) : 0), 0));
+    await client.query("UPDATE tickets SET status = $2, payout_amount = $3 WHERE id = $1", [ticketId, status, totalPaid]);
+    if (payout > 0) {
+      await client.query("UPDATE users SET credit_limit = credit_limit + $2 WHERE id = $1", [ticket.user_id, roundMoney(payout)]);
+    }
+    return {
+      ticketId: String(ticketId),
+      userId: ticket.user_id,
+      username: ticket.username,
+      lotteryCode: ticket.lottery_code,
+      status,
+      amount: Number(ticket.amount ?? 0),
+      payout: roundMoney(payout),
+      totalPaid,
+      items
+    };
+  });
+}
+
+export async function listPendingTicketIdsForDraw(lotteryCode, drawDate) {
+  if (!pool) return [];
+  const { rows } = await pool.query(
+    "SELECT id FROM tickets WHERE lottery_code = $1 AND draw_date = $2 AND status = 'pending' ORDER BY id",
+    [lotteryCode, drawDate]
+  );
+  return rows.map((row) => String(row.id));
+}
+
+export async function countSettledTicketsForDraw(lotteryCode, drawDate) {
+  if (!pool) return 0;
+  const { rows } = await pool.query(
+    "SELECT COUNT(*)::int AS count FROM tickets WHERE lottery_code = $1 AND draw_date = $2 AND status IN ('won', 'lost')",
+    [lotteryCode, drawDate]
+  );
+  return Number(rows[0]?.count ?? 0);
+}
+
+// งวดที่มีโพยรอผล แต่ยังไม่มีผลในระบบ (ถึงวันออกรางวัลแล้ว)
+export async function listDrawDatesAwaitingResult(lotteryCode, uptoDate) {
+  if (!pool) return [];
+  const { rows } = await pool.query(
+    `SELECT DISTINCT t.draw_date
+       FROM tickets t
+       LEFT JOIN lottery_results r ON r.lottery_code = t.lottery_code AND r.draw_date = t.draw_date
+      WHERE t.lottery_code = $1 AND t.status = 'pending' AND t.draw_date <= $2 AND r.id IS NULL
+      ORDER BY t.draw_date`,
+    [lotteryCode, uptoDate]
+  );
+  return rows.map((row) => row.draw_date);
+}
+
+// งวดที่มีผลแล้วแต่ยังมีโพยค้างตรวจ
+export async function listDrawDatesWithPendingTickets(lotteryCode) {
+  if (!pool) return [];
+  const { rows } = await pool.query(
+    `SELECT DISTINCT t.draw_date
+       FROM tickets t
+       JOIN lottery_results r ON r.lottery_code = t.lottery_code AND r.draw_date = t.draw_date
+      WHERE t.lottery_code = $1 AND t.status = 'pending'
+      ORDER BY t.draw_date`,
+    [lotteryCode]
+  );
+  return rows.map((row) => row.draw_date);
 }

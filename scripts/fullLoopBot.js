@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const crypto = require("node:crypto");
+import crypto from "node:crypto";
 
 if (typeof fetch !== "function") {
   console.error("This bot requires Node.js 18+ with the global fetch API.");
@@ -34,7 +34,7 @@ async function request(path, { token, headers, ...options } = {}) {
 }
 
 async function login(username, password) {
-  const body = JSON.stringify({ username, password: sha256(password) });
+  const body = JSON.stringify({ username, password });
   return request("/api/auth/login", { method: "POST", body });
 }
 
@@ -124,7 +124,7 @@ async function main() {
 
   const thaiTicket = await purchase(agentToken, {
     lotteryId: "th-lottery",
-    bets: ["123", "456", "78"],
+    bets: ["123", "45", "7"],
     amount: 250,
     meta: {
       betTypes: ["three-top", "two-bottom", "run-top"],
@@ -132,8 +132,8 @@ async function main() {
       options: { reverse: true },
       items: [
         { number: "123", betType: "three-top", amount: 150 },
-        { number: "456", betType: "two-bottom", amount: 50 },
-        { number: "78", betType: "run-top", amount: 50 }
+        { number: "45", betType: "two-bottom", amount: 50 },
+        { number: "7", betType: "run-top", amount: 50 }
       ]
     }
   });

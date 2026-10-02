@@ -7,7 +7,7 @@ EXCEPTION WHEN duplicate_object THEN null;
 END $$;
 
 DO $$ BEGIN
-  CREATE TYPE lottery_kind AS ENUM ('thai', 'lao');
+  CREATE TYPE lottery_kind AS ENUM ('thai', 'lao', 'viet', 'international');
 EXCEPTION WHEN duplicate_object THEN null;
 END $$;
 
@@ -44,7 +44,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS users (
   id BIGSERIAL PRIMARY KEY,
   username VARCHAR(50) NOT NULL UNIQUE,
-  password_hash CHAR(64) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
   role user_role DEFAULT 'agent',
   credit_limit NUMERIC(12,2) DEFAULT 0,
   credit_used NUMERIC(12,2) DEFAULT 0,
@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS lotteries (
   open_time TIMESTAMP NOT NULL,
   close_time TIMESTAMP NOT NULL,
   status lottery_status DEFAULT 'open',
-  description TEXT
+  description TEXT,
+  group_name VARCHAR(100)
 );
 
 CREATE TABLE IF NOT EXISTS lottery_results (
@@ -121,6 +122,7 @@ ALTER TABLE IF EXISTS tickets
   ALTER COLUMN numbers TYPE TEXT;
 ALTER TABLE IF EXISTS tickets
   ADD COLUMN IF NOT EXISTS draw_date DATE;
+ALTER TABLE IF EXISTS tickets ADD COLUMN IF NOT EXISTS payout_amount NUMERIC(14,2) DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_tickets_lottery ON tickets(lottery_code);
 CREATE INDEX IF NOT EXISTS idx_tickets_lottery_draw ON tickets(lottery_code, draw_date);
 CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets(user_id);
@@ -158,6 +160,12 @@ CREATE TABLE IF NOT EXISTS purchase_logs (
 );
 ALTER TABLE IF EXISTS purchase_logs
   ADD COLUMN IF NOT EXISTS draw_date DATE;
+ALTER TABLE IF EXISTS purchase_logs ADD COLUMN IF NOT EXISTS payout_rate NUMERIC(12,2);
+ALTER TABLE IF EXISTS purchase_logs ADD COLUMN IF NOT EXISTS status VARCHAR(20);
+ALTER TABLE IF EXISTS purchase_logs ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE;
+ALTER TABLE IF EXISTS purchase_logs ADD COLUMN IF NOT EXISTS payout_amount NUMERIC(14,2);
+ALTER TABLE IF EXISTS purchase_logs ADD COLUMN IF NOT EXISTS settled_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_purchase_logs_draw_number ON purchase_logs(lottery_code, draw_date, bet_type, numbers);
 CREATE INDEX IF NOT EXISTS idx_purchase_logs_ticket ON purchase_logs(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_purchase_logs_user ON purchase_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_purchase_logs_lottery_draw ON purchase_logs(lottery_code, draw_date);

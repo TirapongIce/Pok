@@ -1,70 +1,79 @@
-## ระบบหวยไทย & ต่างประเทศ
+# Pok — ระบบทดสอบภายในทีม
 
-โครงการสาธิตระบบเว็บหวยตาม requirement: Front-End React, Back-End Node.js (Express) พร้อมข้อมูลจำลองเพื่อทดสอบ flow สำคัญ เช่น เข้าสู่ระบบ, รายการหวย, แทงโพย, ระบบหลังบ้าน (สมาชิก, เครดิต, รายงาน, ฝาก/ถอน, ตั้งค่าหวย)
+React + Node.js + PostgreSQL สำหรับทดสอบรายการหวย โพยจำลอง และเครดิตจำลอง ไม่มีการเชื่อมต่อผู้ให้บริการรับหรือจ่ายเงินจริง
 
-### โครงสร้าง
+## เริ่มใช้งาน
 
+ใช้ Node.js 24 และ PostgreSQL 16 ติดตั้งด้วย `npm ci --prefix server` และ `npm ci --prefix client`
+
+1. สร้างฐานข้อมูลทดสอบ แล้วรัน `server/schema_postgres.sql` ด้วย `psql -v ON_ERROR_STOP=1`
+2. คัดลอก `server/.env.example` เป็น `server/.env` และตั้งค่าฐานข้อมูล รหัสผ่านแอดมิน และ `THAI_SYNC_AUTO=false` หากต้องการกรอกผลจำลองเอง
+3. รัน `npm run dev` จาก root แล้วเปิด `http://localhost:5173`
+4. สร้างบัญชีสมาชิกทดสอบในหน้าผู้ดูแลระบบ เครดิตทั้งหมดเป็นเครดิตจำลอง
+
+หากใช้ Docker Compose ให้ตั้ง `POSTGRES_PASSWORD` ก่อนรัน และใส่ค่าเดียวกันใน `server/.env` ห้าม commit ไฟล์ `.env`
+
+`NODE_ENV=production` หมายถึงโหมดรัน server ที่เข้มงวด แม้ใช้กับระบบทดสอบ: ต้องตั้ง DB และ `SUPERADMIN_PASSWORD` มิฉะนั้น server จะไม่เริ่ม โหมดไม่มี DB มีไว้สาธิตในเครื่องและเก็บข้อมูลชั่วคราวเท่านั้น
+
+## รหัสผ่านและ session
+
+- Client ส่งรหัสผ่านให้ API ผ่าน HTTPS เมื่อให้ทีมเข้าจากนอกเครื่อง; server เก็บ bcrypt cost 12 ไม่รับ SHA-256 hash เป็นรหัสผ่านแทน
+- บัญชี SHA-256 เดิมย้ายเป็น bcrypt เมื่อเข้าสู่ระบบสำเร็จ รหัสผ่านใหม่อย่างน้อย 8 ตัวอักษร สูงสุด 72 ไบต์ UTF-8
+- Session เก็บใน PostgreSQL เป็น hash ของ token หมดอายุภายใน `SESSION_TTL_HOURS` (ปกติ 8 ชั่วโมง) ใช้ร่วมกันได้หลาย instance; session เดิมก่อนอัปเดตต้อง login ใหม่
+- Login จำกัด 10 ครั้งต่อบัญชี และ 100 ครั้งต่อ IP ใน 15 นาที ค่านี้นับทุก attempt รวมครั้งที่สำเร็จ และคงอยู่หลัง restart
+- การเปลี่ยนรหัสผ่านต้องยืนยันรหัสเดิม และยกเลิก session ของบัญชีทั้งหมด
+- `SUPERADMIN_PASSWORD` ใช้สร้างบัญชีใหม่ ไม่เขียนทับรหัสผ่านทุก restart หากต้อง reset ให้ตั้ง `SUPERADMIN_RESET_PASSWORD=true` เพียงครั้งเดียว แล้วปิดกลับ
+- Token ใน client ยังเก็บใน localStorage จึงต้องป้องกัน XSS ที่ frontend; ยังไม่ได้ย้ายเป็น HttpOnly cookie
+- หลัง reverse proxy จะนับ IP ของ proxy โดยค่าเริ่มต้น ไม่เชื่อ `X-Forwarded-For` จาก client เอง
+
+## สิ่งที่แก้ในรอบนี้
+
+- บันทึกสถานะ เวลาปิด ยอดขั้นต่ำ/สูงสุด และการตั้งค่าลง DB ไม่หายหลัง restart
+- ฝาก/ถอนเครดิตจำลองแบบ atomic ป้องกันการถอนพร้อมกันเกินยอด และอนุมัติ/คืนยอดซ้ำ
+- ถอนตรงโดยแอดมินลด `credit_limit` ไม่เพิ่ม `credit_used`
+- จำกัดไฟล์อัปโหลด 5 MiB; ป้องกันการอ่าน notification ของบัญชีอื่นผ่านการแก้สถานะ
+- ตรวจโพยรายรายการ เก็บเรท ณ เวลาสร้างโพย และป้องกันการจ่ายซ้ำ
+- CI บน GitHub Actions ทดสอบกับ DB แยกและผลจำลอง แล้ว build client เป็น artifact
+
+## ทดสอบ
+
+`npm test` รัน unit tests; DB integration จะข้ามจนกว่าจะตั้ง `RUN_DB_TESTS=true`
+
+ตั้ง DB env ให้ชี้ฐานข้อมูลเฉพาะชื่อที่ลงท้าย `_test` แล้วรัน:
+
+```bash
+RUN_DB_TESTS=true npm test
+PSQL='psql -h 127.0.0.1 -U pok_test -d pok_test' npm run test:qa:fixtures
+npm run build --prefix client
 ```
-lottery-system/
-├─ server/    # Node.js Express mock API
-└─ client/    # React + Vite UI
+
+ส่งรหัสผ่านของ `psql` ผ่าน `PGPASSWORD` หรือ `.pgpass` ชุด fixtures ใช้พอร์ต 4402/4499 และ integration ใช้ 4410/4411 ต้องว่างก่อนทดสอบ ใช้ DB ใหม่สำหรับแต่ละรอบ full-loop เพื่อไม่ให้ผลที่ประกาศแล้วรบกวนกัน
+
+`test:qa:fixtures` เปิด provider จำลองในเครื่อง ทดสอบ sync/scheduler/ตรวจผลโดยไม่ติดต่อเว็บภายนอก ตัวเลขใน fixtures เป็นข้อมูลทดสอบ ไม่ใช่หลักฐานผลรางวัลจริง
+
+`npm run test:qa` เป็นชุดเดิมสำหรับ staging ที่เตรียมไว้เอง โดยตั้ง `BASE`, `PSQL`, `HUAY_SUPERADMIN_USER`, `HUAY_SUPERADMIN_PASSWORD`; ชุดนี้เขียนข้อมูลทดสอบและต้องใช้ฐานข้อมูลทดสอบเท่านั้น
+
+## กติกาที่คงไว้เพื่อทดสอบ
+
+ยังไม่ถือเป็นข้อยืนยันจากฝ่ายธุรกิจ: 3 ตัวหน้าเป็น 2 ชุด; เรท 3 ตัวหน้าโต๊ดใหม่ 75; ลาวสองตัวล่างใช้สองหลักหน้าของเลขสี่หลัก; ขั้นต่ำไทย 10/ลาว 5; รางวัลใช้ยอดหลังส่วนลดโปรโมชัน; maxAmount ปกติรวมทั้งงวดหรือ `scope: "ticket"` ต่อโพย; ฮานอยใช้เรทลาว; โต๊ดเลขซ้ำยังใช้เรทเดิม
+
+ออมสิน/ธ.ก.ส. ยังใช้ปฏิทินจำลองวันที่ 1 และ 16 และลาว/ฮานอย/ออมสิน/ธ.ก.ส. ยังกรอกผลเองหรือใช้ผลจำลอง ไม่อ้างว่าเชื่อมแหล่งทางการแล้ว ตั้งงวดพิเศษผ่านหน้าแอดมินเพื่อทดสอบกรณีอื่นได้
+
+ช่องลดเปอร์เซ็นต์ของเลขอั้นยังไม่มีนิยามที่ทีมยืนยัน จึงปิดการตั้งค่าใหม่ไว้ ค่าที่เคยบันทึกไม่มีผลต่อการคำนวณจนกว่าจะกำหนดความหมาย
+
+## ตรวจข้อมูลย้อนหลัง
+
+รันจากโฟลเดอร์ server:
+
+```bash
+node scripts/reconcilePayouts.js > reconciliation.csv
+npm run fix:draw-dates
 ```
 
-### การเริ่มใช้งาน
+รายงาน reconcile อ่านอย่างเดียว เปรียบเทียบยอดรายรายการกับผลที่เก็บใน DB และเรทที่เก็บไว้ ไม่ยืนยันผลทางการ ไม่สรุปยอดเงินที่เคยโอนจริง และไม่แก้เครดิต รายการไม่มีเรท/ยอดจ่ายเดิมหรือมี manual override ต้องตรวจเอง
 
-1. ติดตั้ง dependency (ต้องใช้ Node 18+)
-   ```bash
-   cd server && npm install
-   cd ../client && npm install
-   ```
-2. รัน API
-   ```bash
-   cd server
-   npm run dev
-   # API จะอยู่ที่ http://localhost:4001
-   ```
-3. รัน Front-End
-   ```bash
-   cd client
-   npm run dev
-   # UI จะอยู่ที่ http://localhost:5173 (proxy /api -> server)
-   ```
+การแก้วันงวดเป็น heuristic และ dry-run โดยปกติ ตรวจเทียบงวดพิเศษก่อนใช้ `npm run fix:draw-dates -- --apply` สำรอง DB ก่อนเสมอ ในรอบนี้ไม่มีการลบผลหรือบัญชีจากฐานข้อมูลที่ผู้ใช้ใช้อยู่
 
-> ต้องการรัน Front-End + API พร้อมกัน?
->
-> ```bash
-> npm install
-> npm run dev
-> ```
->
-> คำสั่งนี้จะรัน `server` และ `client` พร้อมกันในเทอร์มินัลเดียว (หยุดทั้งหมดได้ด้วย `Ctrl+C`)
+## GitHub และการเผยแพร่เว็บ
 
-> หากยังไม่ได้ติดตั้งฐานข้อมูล สามารถใช้ mock data ที่ฝั่ง server ให้มาได้ทันที
-
-### ฟีเจอร์ที่ครอบคลุม Requirement
-
-- **Login + Hash Password**: หน้าล็อกอินเข้ารหัสพาสเวิร์ดด้วย `SHA-256` ก่อนส่งหาทาง API (`client/src/App.jsx`).
-- **Lottery List View**: เมนู `รายการหวย` แสดงแบบการ์ด (list/grid) คล้ายภาพตัวอย่าง (`client/src/App.jsx`, `client/src/styles.css`).
-- **ซื้อหวย**: หน้ากรอกโพยรองรับการกรอกเองและปุ่มเลือกตัวเลขด่วน พร้อมส่งข้อมูลไปยัง `/api/purchases`.
-- **ระบบหลังบ้าน** (`BackOfficePanel`):
-  - 1. จัดการสมาชิก (API `/api/admin/members`)
-  - 2. รายงานเครดิต (เดินบัญชี, เครดิตระหว่างสมาชิก, เช็คเครดิต)
-  - 4. รายงานโพย (`/api/admin/credit-ledger`)
-  - 5. สรุปยอดรายวัน (`/api/admin/daily-summary`)
-  - 6. ฝากตรงถอนตรง (ฟอร์มจำลอง)
-  - 7. Pop-up ประชาสัมพันธ์ (ประกาศเปิดหน้าต่าง overlay)
-  - 8 & 10. ตั้งค่าระบบ/หวย (คอมโพเนนต์ `LotterySettings` + POST `/api/admin/settings`)
-  - 9. รายงานรายได้ (`/api/admin/income-report`)
-  - 11. หวยที่กำลังเปิดรับแทง (Dashboard + API `/api/lotteries`)
-  - 12. ประกาศผลรางวัล (placeholder + คู่มืออัปโหลด)
-- **Agent/Admin sitemap**: สรุปเมนูที่หน้าหลังบ้าน.
-- **Deposit/Withdraw**: ฟอร์มสลับแท็บให้สมาชิกฝาก-ถอนได้ทันที.
-- **Announcements**: API `/api/admin/summary` ส่งรายการแจ้งเตือนให้แสดงในหน้า popup ตามข้อ 7.
-- **Responsive Layout**: Navbar แสดงเครดิต/ประกาศ + ปุ่ม toggle เมนู, sidebar กลายเป็น drawer บนมือถือ
-
-### การต่อยอด
-
-- เชื่อมต่อฐานข้อมูลจริง (เช่น PostgreSQL/MongoDB) เพื่อแทน mock data
-- เพิ่มระบบสิทธิ์ Agent/Admin แบบ JWT แยก role
-- ทำ Job สำหรับประกาศผลหวยอัตโนมัติ + Cron ปิดรอบหวย
-- ออกแบบ UI ให้รองรับรูปจริงตามไฟล์ตัวอย่าง (เพิ่ม resource asset/image)
+Push เข้า GitHub จะรัน CI และสร้าง artifact `team-test-client` เท่านั้น ไม่ได้เผยแพร่ API/DB หรือเว็บไซต์ให้ทีมใช้งานอัตโนมัติ หากนำไปรันบน server ของทีม ให้ deploy API + PostgreSQL และ serve client/dist โดย proxy `/api` ไป API ผ่าน HTTPS

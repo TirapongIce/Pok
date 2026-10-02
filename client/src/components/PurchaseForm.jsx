@@ -46,7 +46,11 @@ export default function PurchaseForm({
   const [manualDigits, setManualDigits] = useState("");
   const [ticketItems, setTicketItems] = useState([]);
   const [lastSubmission, setLastSubmission] = useState(null);
-  const [amountPerBet, setAmountPerBet] = useState("1");
+  const [amountPerBet, setAmountPerBet] = useState(() =>
+    String(
+      lotteries.find((l) => l.id === (lockedLotteryId || initialLotteryId))?.minBet ?? 1
+    )
+  );
   const [activeBlock, setActiveBlock] = useState(0);
   const [bulkPriceInput, setBulkPriceInput] = useState("");
   const [showPriceEditor, setShowPriceEditor] = useState(false);
@@ -67,18 +71,50 @@ export default function PurchaseForm({
 
   const selectedLottery =
     lotteries.find((lottery) => lottery.id === lotteryId) || lotteries[0];
+  // เรทจ่ายจริงจาก server (ตาราง payout_rates) — ใช้แสดงผลและกรองประเภทที่หวยนี้เปิดรับ
+  const [serverRates, setServerRates] = useState(null);
+  useEffect(() => {
+    const code = selectedLottery?.id;
+    if (!code) return undefined;
+    let cancelled = false;
+    setServerRates(null);
+    fetch(`/api/lotteries/${encodeURIComponent(code)}/payout-rates`)
+      .then((response) => (response.ok ? response.json() : []))
+      .then((rows) => {
+        if (cancelled) return;
+        const map = {};
+        (Array.isArray(rows) ? rows : []).forEach((row) => {
+          map[row.betType] = Number(row.rate);
+        });
+        setServerRates(map);
+      })
+      .catch(() => !cancelled && setServerRates({}));
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedLottery?.id]);
   const filteredPayoutOptions = useMemo(() => {
     const allowedId = selectedLottery?.id;
+    const hasServerRates = serverRates && Object.keys(serverRates).length > 0;
     return Object.entries(payoutOptions).reduce((acc, [key, list]) => {
-      acc[key] = list.filter((option) => {
-        if (!option.lotteries || option.lotteries.length === 0) {
-          return true;
-        }
-        return allowedId ? option.lotteries.includes(allowedId) : false;
-      });
+      acc[key] = list
+        .filter((option) => {
+          if (hasServerRates) return serverRates[option.id] != null;
+          if (!option.lotteries || option.lotteries.length === 0) {
+            return true;
+          }
+          return allowedId ? option.lotteries.includes(allowedId) : false;
+        })
+        .map((option) => (hasServerRates ? { ...option, rate: serverRates[option.id] } : option));
       return acc;
     }, {});
-  }, [selectedLottery?.id]);
+  }, [selectedLottery?.id, serverRates]);
+  const rateOf = (betType) =>
+    serverRates?.[betType] ?? payoutOptionMap[betType]?.rate ?? 0;
+  const minBet = Number(selectedLottery?.minBet ?? 1);
+  useEffect(() => {
+    setAmountPerBet((prev) => (Number(prev) < minBet ? String(minBet) : prev));
+  }, [minBet]);
   const isLaoLottery = selectedLottery?.id === "lao-lottery";
   const effectivePromotions =
     promotions && promotions.length ? promotions : fallbackPromotions;
@@ -467,7 +503,7 @@ export default function PurchaseForm({
     resetSelection();
     setTicketItems([]);
     setBulkPriceInput("");
-    setAmountPerBet("1");
+    setAmountPerBet(String(selectedLottery?.minBet ?? 1));
     setActiveBetTypes([payoutOptions[category]?.[0]?.id].filter(Boolean));
     setOptions({ reverse: false, randomFive: false });
     setLaoFilters({ highLow: null, parity: null, quick: null });
@@ -1393,9 +1429,7 @@ export default function PurchaseForm({
                 ) : (
                   ticketItems.map((item) => {
                     const payoutRate = Number(
-                      item.payoutRate ??
-                        payoutOptionMap[item.betType]?.rate ??
-                        0
+                      item.payoutRate ?? rateOf(item.betType)
                     );
                     const amountValue = Number(item.amount ?? 0);
                     const hasRate = Number.isFinite(payoutRate) && payoutRate > 0;

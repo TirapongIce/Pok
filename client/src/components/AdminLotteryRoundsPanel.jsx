@@ -88,7 +88,7 @@ export default function AdminLotteryRoundsPanel({ lotteries = [], onSaved }) {
   }
 
   function applySample() {
-    setText(JSON.stringify([{ day: 1, name: "รอบวันที่ 1" }, { day: 16, name: "รอบวันที่ 16" }], null, 2));
+    setText(JSON.stringify([{ date: "2027-01-16", skip: true }, { date: "2027-01-17", close: "14:30" }], null, 2));
   }
 
   return (
@@ -110,7 +110,7 @@ export default function AdminLotteryRoundsPanel({ lotteries = [], onSaved }) {
           <label>rounds (JSON array)</label>
           <textarea rows={10} value={text} onChange={(e) => setText(e.target.value)} />
           <small>
-            รูปแบบตัวอย่าง: [{`{ "day": 1, "name": "รอบวันที่ 1" }, { "day": 16, "name": "รอบวันที่ 16" }`}]
+            ใช้ปรับงวดที่ไม่ตรงตารางปกติ (เช่น เลื่อน 16 ม.ค. เป็น 17 ม.ค.): เพิ่มงวด {`{ "date": "2027-01-17", "close": "14:30" }`} · ยกเลิกงวดปกติ {`{ "date": "2027-01-16", "skip": true }`}
           </small>
         </div>
         <div style={{ display: "flex", gap: 8 }}>

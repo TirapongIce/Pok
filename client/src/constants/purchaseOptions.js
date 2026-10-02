@@ -14,13 +14,15 @@ export const betStepMap = betSteps.reduce((acc, item) => {
   return acc;
 }, {});
 
+// ค่าสำรองเมื่อโหลดเรทจาก server ไม่ได้ (ค่าจริงมาจาก /api/lotteries/:id/payout-rates)
+// ต้องตรงกับ payoutSeeds ฝั่ง server
 export const payoutOptions = {
   three: [
-    { id: "three-top", label: "3 ตัวบน", rate: 910 },
-    { id: "three-tod", label: "3 ตัวบนโต๊ด", rate: 140 },
-    { id: "three-bottom", label: "3 ตัวล่าง", rate: 170 },
-    { id: "three-front", label: "3 หัว", rate: 450, lotteries: ["th-lottery"] },
-    { id: "three-front-tod", label: "3 หัวโต๊ด", rate: 90, lotteries: ["th-lottery"] }
+    { id: "three-top", label: "3 ตัวบน", rate: 950 },
+    { id: "three-tod", label: "3 ตัวบนโต๊ด", rate: 150 },
+    { id: "three-bottom", label: "3 ตัวล่าง", rate: 450, lotteries: ["th-lottery", "gsb-lottery", "baac-lottery"] },
+    { id: "three-front", label: "3 ตัวหน้า", rate: 450, lotteries: ["th-lottery"] },
+    { id: "three-front-tod", label: "3 ตัวหน้าโต๊ด", rate: 75, lotteries: ["th-lottery"] }
   ],
   two: [
     { id: "two-top", label: "2 ตัวบน", rate: 95 },

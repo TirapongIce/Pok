@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const crypto = require("node:crypto");
+import crypto from "node:crypto";
 
 if (typeof fetch !== "function") {
   console.error("This bot requires Node.js 18+ with the global fetch API.");
@@ -36,7 +36,7 @@ async function request(path, { token, headers, ...options } = {}) {
 }
 
 async function login(username, password) {
-  return request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password: sha256(password) }) });
+  return request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
 }
 
 async function createUser(token, { username, password, role = "agent", creditLimit = 0 }) {

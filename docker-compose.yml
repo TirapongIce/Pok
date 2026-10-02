@@ -9,7 +9,7 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_USER: huay_aud
-      POSTGRES_PASSWORD: "@Abc1234567890AUD"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD for your local test database}"
       POSTGRES_DB: huay_aud_db
     volumes:
       - pgdata:/var/lib/postgresql/data

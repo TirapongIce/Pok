@@ -9,11 +9,11 @@ This file contains focused, actionable guidance for code-writing AI agents worki
 - `scripts/`: automation and testing helpers. `scripts/fullLoopBot.js` is a runnable example that uses the public API to exercise admin flows and purchases.
 
 2. Node / environment requirements
-- Node >= 18 recommended (the bot uses global `fetch`). The server uses ES modules (`"type": "module"` in `client/package.json` and ESM imports in `server/src`).
+- Node 24 recommended (the bot uses global `fetch`). The server uses ES modules (`"type": "module"` in `client/package.json` and ESM imports in `server/src`).
 - Important env vars:
   - Database: `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_PORT`, `DB_SSL`, `DB_SCHEMA` (if missing the server runs in demo/fallback mode).
   - Admin seed: `SUPERADMIN_USERNAME`, `SUPERADMIN_PASSWORD`, `SUPERADMIN_CREDIT_LIMIT` (used by `server/src/index.js` to ensure an admin user).
-  - Demo agent password: `DEMO_AGENT_PASSWORD` (printed on server startup when seeding demo data).
+  - Demo agent password: `DEMO_AGENT_PASSWORD` (never log passwords).
   - Bot: `HUAY_AUD_API` (base URL), `HUAY_SUPERADMIN_USER`, `HUAY_SUPERADMIN_PASSWORD` used by `scripts/fullLoopBot.js`.
   - Server port: `PORT` (defaults to `4001`).
 
@@ -32,8 +32,8 @@ This file contains focused, actionable guidance for code-writing AI agents worki
   - `npm run bot:full` (root script runs `node scripts/fullLoopBot.js`).
 
 5. API patterns and conventions (use these examples)
-- Authentication: `POST /api/auth/login` — accepts `{ username, password }`. The server accepts either a raw password or a SHA-256 hex string; examples in `scripts/fullLoopBot.js` show sending a SHA-256 hash.
-- Session token: API uses `x-session-token` header for authenticated calls (server stores a simple in-memory `sessions` map). When writing integrations, use `x-session-token` as shown in `fullLoopBot.js`.
+- Authentication: `POST /api/auth/login` — accepts `{ username, password }`. Send the raw password over HTTPS; the server verifies bcrypt and migrates legacy SHA-256 records. Never send a stored hash as a credential.
+- Session token: API uses `x-session-token` header for authenticated calls (server stores expiring, hashed tokens in PostgreSQL; local demo mode uses memory). When writing integrations, use `x-session-token` as shown in `fullLoopBot.js`.
 - Admin routes: under `/api/admin/*` (user management, chat threads, payout/lottery control). The bot uses these to create users and save results.
 - Purchases: `POST /api/purchases` expects `{ lotteryId, bets, amount, meta, promotionCode }`. See `scripts/fullLoopBot.js` for a concrete `purchase(...)` payload example.
 
@@ -48,7 +48,7 @@ This file contains focused, actionable guidance for code-writing AI agents worki
 - Date handling: draw dates and result rows sometimes use ISO-date strings. Repository mapping functions normalize to YYYY-MM-DD (see `mapLotteryResultRow`).
 
 8. Tests / automation
-- There are no unit tests in the repo. Use `scripts/fullLoopBot.js` as a canonical integration test harness to exercise admin/user flows. It demonstrates login (admin + agent), deposits, withdrawals, purchases, restrictions, and result uploads.
+- Run `npm test`, `RUN_DB_TESTS=true npm test` against an isolated PostgreSQL database ending in `_test`, and `npm run test:qa:fixtures` with `PSQL`. CI runs these and builds the client. All credits and result fixtures are for internal testing.
 
 9. When proposing changes
 - Reference the exact files you modify (e.g., `server/src/index.js`, `server/src/repositories/managementRepository.js`, `client/src/components/PurchaseForm.jsx`).

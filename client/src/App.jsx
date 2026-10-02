@@ -80,6 +80,8 @@ const staffNavGroups = [
     items: [
       { id: "lottery-control", label: "เปิด-ปิดระบบหวย", labelKey: "nav.lottery.control", icon: "🎛️", view: "backoffice", section: "lottery-control", homeShortcut: true },
       { id: "lottery-numbers", label: "เลขอั้น", labelKey: "nav.restrictions", icon: "#️⃣", view: "backoffice", section: "lottery-numbers", homeShortcut: false },
+      { id: "payout-rates", label: "ตั้งค่าเรทจ่าย", icon: "💹", view: "backoffice", section: "payout-rates", homeShortcut: false, requiresSuperAdmin: true },
+      { id: "lottery-rounds", label: "ตั้งค่างวดพิเศษ", icon: "🗓️", view: "backoffice", section: "lottery-rounds", homeShortcut: false, requiresSuperAdmin: true },
       { id: "round-number-summary", label: "สรุปเลขซื้อรายงวด", icon: "📊", view: "backoffice", section: "round-number-summary", homeShortcut: false, requiresSuperAdmin: true },
       { id: "lottery-results", label: "ประกาศผลรางวัล", labelKey: "nav.lottery.results", icon: "🏆", view: "backoffice", section: "lottery-results", homeShortcut: true },
       { id: "announcements", label: "ข่าว-ประชาสัมพันธ์", labelKey: "nav.announcements", icon: "📰", view: "backoffice", section: "announcements", homeShortcut: true },
@@ -463,14 +465,6 @@ function TopNav({
   );
 }
 
-async function hashPassword(password) {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(password);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 function AnnouncementPopup({ item, onClose }) {
   if (!item) return null;
 
@@ -654,7 +648,13 @@ export default function App() {
       }
       if (!response.ok) {
         const msg = await response.text();
-        throw new Error(msg || "REQUEST_FAILED");
+        let parsed = null;
+        try {
+          parsed = JSON.parse(msg);
+        } catch {
+          // not JSON
+        }
+        throw new Error(parsed?.message || msg || "REQUEST_FAILED");
       }
       return response.json();
     },
@@ -893,12 +893,23 @@ export default function App() {
 
   const handleSyncThaiLottery = useCallback(async () => {
     try {
-      await callApi("/api/admin/sync/thai-lottery", { method: "POST" });
-      alert("ซิงก์ผลหวยไทยล่าสุดสำเร็จ");
+      const result = await callApi("/api/admin/sync/thai-lottery", {
+        method: "POST",
+        body: JSON.stringify({ includeLatest: true })
+      });
+      const latest = result?.results?.[0];
+      const evaluated = (result?.evaluations || []).reduce((sum, e) => sum + Number(e.evaluated ?? 0), 0);
+      const payout = (result?.evaluations || []).reduce((sum, e) => sum + Number(e.totalPayout ?? 0), 0);
+      const skipped = (result?.skipped || []).map((s) => `${s.id}: ${s.reason}`).join("\n");
+      alert(
+        latest
+          ? `ซิงก์ผลงวด ${latest.drawDate} สำเร็จ (รางวัลที่ 1: ${latest.firstPrize})\nตรวจโพย ${evaluated} ใบ จ่ายรางวัล ${payout.toLocaleString()} บาท`
+          : `ไม่มีผลใหม่${skipped ? `\n${skipped}` : ""}`
+      );
       await loadDashboard();
     } catch (err) {
       console.error("sync thai lottery failed:", err);
-      alert("ไม่สามารถซิงก์ผลหวยไทยได้");
+      alert(`ไม่สามารถซิงก์ผลหวยไทยได้: ${err.message}`);
     }
   }, [callApi, loadDashboard]);
 
@@ -998,6 +1009,15 @@ export default function App() {
     [callApi]
   );
 
+  const handleSavePayoutRates = useCallback(
+    async (lotteryCode, rates) =>
+      callApi(`/api/admin/payout-rates/${encodeURIComponent(lotteryCode)}`, {
+        method: "PUT",
+        body: JSON.stringify(rates)
+      }),
+    [callApi]
+  );
+
   const handleToggleLotteryStatus = useCallback(
     async (lotteryId, nextStatus) => {
       const target = (payload.lotteries || []).find((l) => l.id === lotteryId || l.code === lotteryId);
@@ -1056,11 +1076,10 @@ export default function App() {
       setLoginLoading(true);
       setLoginError("");
       try {
-        const passwordHash = await hashPassword(password);
         const response = await fetch("/api/auth/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, password: passwordHash })
+          body: JSON.stringify({ username, password })
         });
         if (!response.ok) {
           const msg = await response.text();
@@ -1206,8 +1225,9 @@ export default function App() {
       const status = item.status === "closed" ? "closed" : scheduleStatus ?? genericState?.status ?? "open";
       const closeTime = scheduleState?.countdownTime ?? genericState?.countdownTime ?? displayCloseTime;
       const nextOpenTime = genericState?.nextOpen ?? displayOpenTime;
-      const nextCloseTime = genericState?.nextClose ?? closeTime;
-      return { ...base, status, closeTime: nextCloseTime, openTime: nextOpenTime };
+      // เวลาปิดรับที่ server ใช้ตรวจจริง (มีผลเหนือการคำนวณฝั่งหน้าเว็บ)
+      const nextCloseTime = item.currentCloseAt ?? genericState?.nextClose ?? closeTime;
+      return { ...base, status, closeTime: nextCloseTime, openTime: nextOpenTime, drawDate: item.currentDrawDate ?? base.drawDate };
     });
   }, [resolvedLotteries]);
   const purchasePromotions = useMemo(
@@ -1485,14 +1505,14 @@ export default function App() {
   );
 
   const handlePasswordChange = useCallback(
-    async (password) => {
+    async (password, currentPassword) => {
       await callApi("/api/profile/password", {
         method: "POST",
-        body: JSON.stringify({ password })
+        body: JSON.stringify({ password, currentPassword })
       });
-      alert("เปลี่ยนรหัสผ่านสำเร็จ");
+      persistSession(null);
     },
-    [callApi]
+    [callApi, persistSession]
   );
 
   const renderMainContent = () => {
@@ -1668,6 +1688,7 @@ export default function App() {
             onScanTickets={handleScanTickets}
             onFetchRoundSummary={handleFetchRoundSummary}
             onFetchPayoutRates={handleFetchPayoutRates}
+            onSavePayoutRates={handleSavePayoutRates}
           />
         );
       default:
@@ -1719,6 +1740,7 @@ export default function App() {
           </div>
           <div className="login-form">
             <h2>{t("login.title", "เข้าสู่ระบบตัวแทน")}</h2>
+            <p className="badge badge-warning">ระบบทดสอบภายในทีม — ใช้เครดิตจำลองเท่านั้น</p>
             {loginError && <p className="badge badge-warning">{loginError}</p>}
             <form onSubmit={handleLogin}>
               <div className="field">
@@ -1760,6 +1782,7 @@ export default function App() {
         <div className={`sidebar-backdrop ${sidebarOpen ? "active" : ""}`} onClick={() => setSidebarOpen(false)} />
         <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>{navList}</aside>
         <main className="content">
+          <p className="badge badge-warning">ระบบทดสอบภายในทีม — ใช้เครดิตจำลองเท่านั้น</p>
           {loading && <p className="text-muted">กำลังโหลดข้อมูล...</p>}
           {error && <p className="text-error">{error}</p>}
           {renderMainContent()}

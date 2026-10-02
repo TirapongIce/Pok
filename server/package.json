@@ -5,9 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "node src/index.js",
-    "start": "NODE_ENV=production node src/index.js"
+    "start": "NODE_ENV=production node src/index.js",
+    "fix:draw-dates": "node scripts/fixDrawDates.js",
+    "report:reconcile": "node scripts/reconcilePayouts.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.3",

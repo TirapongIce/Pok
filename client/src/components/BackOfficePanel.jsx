@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import NewsPanel from "./NewsPanel";
+import PayoutRatesPanel from "./PayoutRatesPanel";
 import AdminLotteryRoundsPanel from "./AdminLotteryRoundsPanel";
 import { payoutOptionMap } from "../constants/purchaseOptions";
 import { formatBetNumbers, formatDrawDateLabel } from "../utils/lotteryHelpers";
@@ -57,6 +58,7 @@ export default function BackOfficePanel({
   onScanTickets,
   onFetchRoundSummary,
   onFetchPayoutRates,
+  onSavePayoutRates,
   onCreateRestrictionsBatch
 }) {
   const initialUserForm = {
@@ -2064,7 +2066,7 @@ export default function BackOfficePanel({
           />
         </div>
         <div className="field">
-          <label>จำกัดยอดต่อบิล</label>
+          <label>วงเงินเลขอั้น</label>
           <input
             name="maxAmount"
             value={newRestriction.maxAmount}
@@ -2075,8 +2077,9 @@ export default function BackOfficePanel({
           />
         </div>
         <div className="field">
-          <label>ลดเปอร์เซ็นต์</label>
+          <label>ลดเปอร์เซ็นต์ (ยังไม่เปิดใช้)</label>
           <input
+            disabled
             name="discountPercent"
             value={newRestriction.discountPercent}
             onChange={handleRestrictionFieldChange}
@@ -2087,17 +2090,14 @@ export default function BackOfficePanel({
           />
         </div>
         <div className="field">
-          <label>ประเภทสูตร</label>
+          <label>ขอบเขตวงเงิน</label>
           <select
             name="scope"
             value={newRestriction.scope}
             onChange={handleRestrictionFieldChange}
           >
-            <option value="">ทั่วไป</option>
-            <option value="three">เลข 3 ตัว</option>
-            <option value="two">เลข 2 ตัว</option>
-            <option value="double">เลขเบิ้ล</option>
-            <option value="run">เลขวิ่ง</option>
+            <option value="">ยอดรวมทั้งงวด</option>
+            <option value="ticket">ต่อโพย</option>
           </select>
         </div>
         <div className="field" style={{ gridColumn: "1 / -1" }}>
@@ -3014,6 +3014,14 @@ export default function BackOfficePanel({
         return lotteryNumbersView;
       case "lottery-results":
         return lotteryResultAdminView;
+      case "payout-rates":
+        return (
+          <PayoutRatesPanel
+            lotteries={lotteries}
+            onFetchPayoutRates={onFetchPayoutRates}
+            onSavePayoutRates={onSavePayoutRates}
+          />
+        );
       case "lottery-rounds":
         return (
           <AdminLotteryRoundsPanel lotteries={lotteries} onSaved={onRefresh} />

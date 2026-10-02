@@ -1,7 +1,9 @@
+> คู่มือนี้เป็นเอกสารเดิม โปรดใช้ [README ล่าสุด](../README.md) สำหรับการตั้งค่ารหัสผ่านและชุดทดสอบ
+
 # คู่มือการติดตั้งและรันระบบหวย
 
 ## 1. ข้อกำหนดระบบ
-- Node.js 18 ขึ้นไป
+- Node.js 24 ขึ้นไป
 - npm 9 ขึ้นไป
 - Docker Desktop หรือ PostgreSQL local เฉพาะกรณีต้องการใช้ฐานข้อมูลจริง
 - macOS, Linux หรือ Windows
@@ -74,7 +76,7 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=huay_aud_db
 DB_USER=huay_aud
-DB_PASSWORD=@Abc1234567890AUD
+DB_PASSWORD=YOUR_LOCAL_TEST_PASSWORD
 ```
 
 apply schema:

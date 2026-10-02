@@ -6,6 +6,12 @@
     "dev": "node dev.js",
     "dev:client": "npm run dev --prefix client",
     "dev:server": "npm run dev --prefix server",
-    "bot:full": "node scripts/fullLoopBot.js"
+    "bot:full": "node scripts/fullLoopBot.js",
+    "test:qa": "node scripts/qaFullLoop.mjs",
+    "test": "node --test server/test/*.test.js",
+    "test:qa:fixtures": "node scripts/runQa.mjs"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

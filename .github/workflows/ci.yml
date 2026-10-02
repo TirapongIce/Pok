@@ -1,0 +1,51 @@
+name: Test team sandbox
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pok_test
+          POSTGRES_PASSWORD: pok_test_only
+          POSTGRES_DB: pok_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pok_test -d pok_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USER: pok_test
+      DB_PASSWORD: pok_test_only
+      DB_NAME: pok_test
+      DB_SSL: false
+      PGPASSWORD: pok_test_only
+      RUN_DB_TESTS: true
+      PSQL: psql -h 127.0.0.1 -U pok_test -d pok_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            client/package-lock.json
+      - run: npm ci --prefix server
+      - run: npm ci --prefix client
+      - name: Initialize isolated schema
+        run: psql -h 127.0.0.1 -U pok_test -d pok_test -v ON_ERROR_STOP=1 -f server/schema_postgres.sql
+      - run: npm test
+      - run: npm run test:qa:fixtures
+      - run: npm run build --prefix client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: team-test-client
+          path: client/dist
