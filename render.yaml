@@ -5,7 +5,7 @@ services:
     plan: free
     region: singapore
     dockerfilePath: ./Dockerfile
-    dockerCommand: /bin/sh -c "node scripts/initDatabase.js && exec node src/index.js"
+    dockerCommand: /bin/sh scripts/startHosted.sh
     healthCheckPath: /api/health/db
     envVars:
       - key: SUPERADMIN_USERNAME
